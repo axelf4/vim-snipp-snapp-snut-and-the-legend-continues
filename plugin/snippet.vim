@@ -69,7 +69,8 @@ function s:ExpandOrJump(...) abort
 		let [_, lnum, col; rest] = getcurpos()
 		let col -= 2 " Take care of foo
 
-		let parsed = s:ReadSnippetBody(g:snippetDef)
+		let snippet = s:ReadSnippetBody(g:snippetDef)
+		let parsed = snippet.content
 		let c = col " Current column
 		let current_lnum = lnum
 		let replacement = []
@@ -93,13 +94,13 @@ function s:ExpandOrJump(...) abort
 
 			eval replacement->add(current_line)
 			let current_lnum += 1
+			let c = 1
 		endfor
 
 		" TODO: Handle indent
 		call s:Edit(lnum, col, lnum, col + 3, replacement)
 		call cursor(lnum, col) " Set cursor to start
 
-		echom placeholders
 		for placeholder in placeholders
 			call prop_add(placeholder.lnum, placeholder.col, #{
 						\ length: placeholder.length,
@@ -140,19 +141,26 @@ endfunction
 
 " {text} is a List of lines
 function s:ReadSnippetBody(text) abort
-	function! s:ParseLine(i, line) abort
+	let num_placeholders = 0
+	let has_placeholder_zero = 0
+
+	function! s:ParseLine(i, line) abort closure
 		let result = []
 		let line = a:line
 		while 1
 			let res = matchlist(line, '\([^$]*\)\%($\%({\(\d\+\)\%(:\([^}]*\)\)\?}\)\(.*\)\)\?')
 			echom res
-			let [match, before, digit, initial, after; rest] = res
+			let [match, before, number, initial, after; rest] = res
 			if empty(match) | break | endif
 			if !empty(before)
 				eval result->add(#{type: 'text', text: before})
 			endif
-			if !empty(digit)
-				eval result->add(#{type: 'placeholder', id: str2nr(digit), initial: initial})
+			if !empty(number)
+				eval result->add(#{type: 'placeholder', id: str2nr(number), initial: initial})
+				let num_placeholders += 1
+				if number == 0
+					let has_placeholder_zero = 1
+				endif
 			endif
 			let line = after
 		endwhile
@@ -162,13 +170,40 @@ function s:ReadSnippetBody(text) abort
 	let result = a:text->copy()->map(funcref('s:ParseLine'))
 
 	" Add tab stop after snippet
-	eval result[-1]->add(#{type: 'placeholder', id: 0, initial: ''})
+	if !has_placeholder_zero
+		eval result[-1]->add(#{type: 'placeholder', id: 0, initial: ''})
+		let num_placeholders += 1
+	endif
 
-	return result
+	" Synthesize order of placeholders and mirrors
+	let placeholderOrder = repeat([-1], num_placeholders)
+	let i = 0
+	for eline in result
+		for item in eline
+			if item.type ==# 'placeholder'
+				if placeholderOrder[item.id] != -1 | throw 'Duplicate placeholders' | endif
+				let placeholderOrder[item.id] = i
+				let i += 1
+			endif
+		endfor
+	endfor
+
+	return #{
+				\ content: result,
+				\ num_placeholders: num_placeholders,
+				\ placeholderOrder: placeholderOrder,
+				\ }
+}
 endfunction
 
+let snippetDef2 =<< trim END
+	console.log(${1:foo})fesfe
+END
+
 let snippetDef =<< trim END
-console.log(${1:foo})fesfe
+	/begin{${1:align}}
+		${0}
+	/end{fin}
 END
 
 inoremap <script> <Plug>SnipExpandOrJump <Esc>:call <SID>ExpandOrJump()<CR>
@@ -176,3 +211,42 @@ inoremap <script> <Plug>SnipExpandOrJump <Esc>:call <SID>ExpandOrJump()<CR>
 " Can use <C-R>= in insmode to not move cursor
 imap <unique> <expr> <Tab> <SID>ShouldTrigger() ? "\<Plug>SnipExpandOrJump"
 			\ : "\<Tab>"
+
+function s:Listener(bufnr, start, end, added, changes) abort
+	" TODO Quit early if there are no active snippets
+
+	" Clear snippet stack if edited line not containing a placeholder
+	for change in a:changes
+		if change.added < 0
+			" Skip deletions
+			continue
+		endif
+
+		for lnum in range(change.lnum, change.end + change.added - 1)
+			" If the change was not to active placeholder: Quit current snippet
+			let props = prop_list(lnum)->filter({_, v -> v.type ==# 'placeholder'})
+			if props->empty()
+				" TODO Only remove active snippet, not all of them
+				echom 'removed'
+				call prop_remove(#{type: 'placeholder'})
+				break
+			endif
+		endfor
+	endfor
+endfunction
+
+function s:OnBufEnter() abort
+	if exists('b:snippet_stack') | return | endif
+	let b:snippet_stack = []
+
+	call listener_add(funcref('s:Listener'))
+endfunction
+
+augroup snippets2
+	autocmd!
+	autocmd BufEnter * call s:OnBufEnter()
+augroup END
+
+nnoremap <F8> :echom prop_list(line('.'))<CR>
+
+enew
