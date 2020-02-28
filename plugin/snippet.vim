@@ -84,7 +84,6 @@ endfunction
 "
 " Returns false if failed.
 function s:ExpandOrJump(...) abort
-	let did_expand = 0
 	if s:should_expand
 		let [_, lnum, col; rest] = getcurpos()
 		let col -= 2 " Take care of foo
@@ -157,10 +156,10 @@ function s:ExpandOrJump(...) abort
 		endfor
 
 		eval b:snippet_stack->add(instance)
-		return
+		return 1
 	endif
 
-	call s:JumpForward()
+	return s:JumpForward()
 endfunction
 
 function s:PopActiveSnippet() abort
@@ -338,12 +337,17 @@ function s:Listener(bufnr, start, end, added, changes) abort
 		for lnum in range(change.lnum, change.end + change.added - 1)
 			" If the change was not to active placeholder: Quit current snippet
 			let props = prop_list(lnum)->filter({_, v -> v.type ==# 'placeholder'})
-			if props->empty()
-				" TODO Only remove active snippet, not all of them
-				echom 'pop because listener'
+			while !(b:snippet_stack->empty())
+				let found = 0
+				for prop in props
+					if b:snippet_stack[-1]->s:HasPlaceholder(prop.id)
+						let found = 1
+						break
+					endif
+				endfor
+				if found | break | endif
 				call s:PopActiveSnippet()
-				break
-			endif
+			endwhile
 		endfor
 	endfor
 endfunction
