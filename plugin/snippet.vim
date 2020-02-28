@@ -8,6 +8,8 @@ call prop_type_add('placeholder', #{
 			\ end_incl: 1,
 			\ })
 
+let s:next_placeholder_id = 0
+
 " Replace the specified range with the given text.
 "
 " Start is inclusive, while end is exclusive.
@@ -47,17 +49,7 @@ function s:ShouldTrigger() abort
 		return 1
 	endif
 
-	" Search forward from cursor for tab stop
-	let prop = prop_find(#{
-				\ type: 'placeholder',
-				\ skipstart: 0,
-				\ }, 'f')
-	echom prop
-	if prop->empty()
-		return
-	else
-		return 1
-	endif
+	return s:JumpForward(#{dry_run: 1}) " Return whether can jump forward
 endfunction
 
 " Try to expand a snippet or jump to the next tab stop.
@@ -70,12 +62,11 @@ function s:ExpandOrJump(...) abort
 		let col -= 2 " Take care of foo
 
 		let snippet = s:ReadSnippetBody(g:snippetDef)
-		let parsed = snippet.content
 		let c = col " Current column
 		let current_lnum = lnum
 		let replacement = []
 		let placeholders = []
-		for eline in parsed
+		for eline in snippet.content
 			let current_line = ''
 			for item in eline
 				if item.type ==# 'text'
@@ -84,7 +75,11 @@ function s:ExpandOrJump(...) abort
 				elseif item.type ==# 'placeholder'
 					let text = item.initial
 					" TODO Handle multiline text
-					eval placeholders->add(#{lnum: current_lnum, col: c, length: text->len()})
+					eval placeholders->add(#{
+								\ lnum: current_lnum, col: c,
+								\ length: text->len(),
+								\ number: item.id,
+								\ })
 					let current_line ..= text
 					let c += text->len()
 				else
@@ -101,30 +96,70 @@ function s:ExpandOrJump(...) abort
 		call s:Edit(lnum, col, lnum, col + 3, replacement)
 		call cursor(lnum, col) " Set cursor to start
 
+		let first_placeholder_id = s:next_placeholder_id
+		let s:next_placeholder_id += placeholders->len()
 		for placeholder in placeholders
 			call prop_add(placeholder.lnum, placeholder.col, #{
 						\ length: placeholder.length,
 						\ type: 'placeholder',
+						\ id: first_placeholder_id + placeholder.number,
 						\ })
 		endfor
+
+		let instance = #{
+					\ first_placeholder_id: first_placeholder_id,
+					\ next_placeholder: placeholders->len() > 1 ? 1 : 0,
+					\ num_placeholders: placeholders->len(),
+					\ }
+		eval b:snippet_stack->add(instance)
 
 		let did_expand = 1
 	endif
 
-	" Search forward from cursor for tab stop
-	let prop = prop_find(#{
-				\ type: 'placeholder',
-				\ skipstart: !did_expand,
-				\ }, 'f')
-	if prop->empty()
-		return
-	endif
+	call s:JumpForward()
+endfunction
+
+function s:JumpForward(...) abort
+	let opts = a:0 >= 1 ? a:1 : {}
+	let dry_run = opts->get('dry_run', 0)
+
+	let prop = {}
+	while prop->empty()
+		" If there are no active snippet instances
+		if b:snippet_stack->empty()
+			return 0
+		endif
+
+		let current_instance = b:snippet_stack[-1]
+		let next_placeholder = current_instance.next_placeholder
+
+		" Search forward from cursor for tab stop
+		" FIXME Cannot provide a type='placeholder' here because it is an OR...
+		let prop = prop_find(#{
+					\ id: current_instance.first_placeholder_id + next_placeholder,
+					\ skipstart: 0,
+					\ }, 'f')
+
+		" If just looking for if we can jump: Report true
+		if !empty(prop) && dry_run | return 1 | endif
+
+		" Increment the next placeholder variable
+		if next_placeholder == 0
+			eval b:snippet_stack->remove(-1) " Pop current snippet instance
+		else
+			let current_instance.next_placeholder =
+						\ next_placeholder >= current_instance.num_placeholders - 1
+						\ ? 0 : next_placeholder + 1
+		endif
+	endwhile
+
+	" Found the property to jump to!
+	echom 'Jumping to prop:' prop
 
 	" Leave user editing the next tab stop
 	let save_virtualedit = &virtualedit
 	try
 		set virtualedit=onemore
-		echom 'prop' prop
 		call cursor(prop.lnum, prop.col) " Position cursor at start
 		let zero_len = prop.length == 0
 		if zero_len
@@ -213,14 +248,13 @@ imap <unique> <expr> <Tab> <SID>ShouldTrigger() ? "\<Plug>SnipExpandOrJump"
 			\ : "\<Tab>"
 
 function s:Listener(bufnr, start, end, added, changes) abort
-	" TODO Quit early if there are no active snippets
+	" Quit early if there are no active snippets
+	if b:snippet_stack->empty() | return | endif
 
 	" Clear snippet stack if edited line not containing a placeholder
 	for change in a:changes
-		if change.added < 0
-			" Skip deletions
-			continue
-		endif
+		" Skip deletions since no efficient way to know if snippet was deleted
+		if change.added < 0 | continue | endif
 
 		for lnum in range(change.lnum, change.end + change.added - 1)
 			" If the change was not to active placeholder: Quit current snippet
@@ -242,11 +276,9 @@ function s:OnBufEnter() abort
 	call listener_add(funcref('s:Listener'))
 endfunction
 
-augroup snippets2
+augroup snippet
 	autocmd!
 	autocmd BufEnter * call s:OnBufEnter()
 augroup END
 
 nnoremap <F8> :echom prop_list(line('.'))<CR>
-
-enew
