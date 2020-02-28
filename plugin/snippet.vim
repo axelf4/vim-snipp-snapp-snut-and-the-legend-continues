@@ -1,4 +1,7 @@
 " Vim plugin for snippets
+if !(has('textprop') && has("patch-8.2.324"))
+	throw 'Incompatible Vim version!'
+endif
 
 highlight Placeholder ctermbg=darkblue
 
@@ -9,6 +12,8 @@ call prop_type_add('placeholder', #{
 			\ })
 
 let s:next_placeholder_id = 0
+" Map from placeholder ID:s to their respective snippet instances.
+let s:placeholder2instance = {}
 
 " Replace the specified range with the given text.
 "
@@ -52,6 +57,29 @@ function s:ShouldTrigger() abort
 	return s:JumpForward(#{dry_run: 1}) " Return whether can jump forward
 endfunction
 
+function s:SelectText(lnum, col, end_lnum, end_col) abort
+	let save_virtualedit = &virtualedit
+	try
+		set virtualedit=onemore
+		call cursor(a:lnum, a:col) " Position cursor at start
+		let zero_len = a:lnum == a:end_lnum && a:col == a:end_col
+		if zero_len
+			startinsert
+		else
+			execute 'normal! gh' | " Start Select mode
+			call cursor(a:end_lnum, a:end_col) " Position cursor at end
+			execute "normal! \<C-O>\<C-H>" | " Go back one char
+		endif
+	finally
+		let &virtualedit = save_virtualedit
+	endtry
+endfunction
+
+function s:SelectProp(prop) abort
+	" TODO Add support for multiline props
+	call s:SelectText(a:prop.lnum, a:prop.col, a:prop.lnum, a:prop.col + a:prop.length)
+endfunction
+
 " Try to expand a snippet or jump to the next tab stop.
 "
 " Returns false if failed.
@@ -62,116 +90,160 @@ function s:ExpandOrJump(...) abort
 		let col -= 2 " Take care of foo
 
 		let snippet = s:ReadSnippetBody(g:snippetDef)
-		let c = col " Current column
-		let current_lnum = lnum
-		let replacement = []
 		let placeholders = []
-		for eline in snippet.content
-			let current_line = ''
-			for item in eline
-				if item.type ==# 'text'
-					let current_line ..= item.text
-					let c += item.text->len()
-				elseif item.type ==# 'placeholder'
-					let text = item.initial
-					" TODO Handle multiline text
-					eval placeholders->add(#{
-								\ lnum: current_lnum, col: c,
-								\ length: text->len(),
-								\ number: item.id,
-								\ })
-					let current_line ..= text
-					let c += text->len()
-				else
-					throw 'Bad type'
-				endif
+
+		let builder = #{col: col, lnum: lnum, text: [""]}
+		let indent = getline(lnum)->matchstr('^\s*')
+		function builder.append(string) abort
+			let self.text[-1] ..= a:string
+			let self.col += a:string->len()
+		endfunction
+		function builder.newLine() abort closure
+			eval self.text->add(indent)
+			let self.lnum += 1
+			let self.col = 1 + indent->len()
+		endfunction
+
+		echom snippet.content
+
+		function! s:HandleContent(content) abort closure
+			let first = 1
+			for eline in a:content
+				if !first | call builder.newLine() | endif
+				let first = 0
+
+				for item in eline
+					if item.type ==# 'text'
+						call builder.append(item.text)
+					elseif item.type ==# 'placeholder'
+						let [start_lnum, start_col] = [builder.lnum, builder.col]
+						call s:HandleContent(item.initial)
+						eval placeholders->add(#{
+									\ lnum: start_lnum, col: start_col,
+									\ end_lnum: builder.lnum, end_col: builder.col,
+									\ number: item.id,
+									\ })
+					else
+						throw 'Bad type'
+					endif
+				endfor
 			endfor
+		endfunction
+		call s:HandleContent(snippet.content)
 
-			eval replacement->add(current_line)
-			let current_lnum += 1
-			let c = 1
-		endfor
-
-		" TODO: Handle indent
-		call s:Edit(lnum, col, lnum, col + 3, replacement)
-		call cursor(lnum, col) " Set cursor to start
+		call s:Edit(lnum, col, lnum, col + 3, builder.text)
 
 		let first_placeholder_id = s:next_placeholder_id
 		let s:next_placeholder_id += placeholders->len()
-		for placeholder in placeholders
-			call prop_add(placeholder.lnum, placeholder.col, #{
-						\ length: placeholder.length,
-						\ type: 'placeholder',
-						\ id: first_placeholder_id + placeholder.number,
-						\ })
-		endfor
-
 		let instance = #{
 					\ first_placeholder_id: first_placeholder_id,
-					\ next_placeholder: placeholders->len() > 1 ? 1 : 0,
 					\ num_placeholders: placeholders->len(),
 					\ }
-		eval b:snippet_stack->add(instance)
+		let first_placeholder = placeholders->len() > 1 ? 1 : 0
 
-		let did_expand = 1
+		for placeholder in placeholders
+			let placeholder_id = first_placeholder_id + placeholder.number
+			call prop_add(placeholder.lnum, placeholder.col, #{
+						\ end_lnum: placeholder.end_lnum, end_col: placeholder.end_col,
+						\ type: 'placeholder',
+						\ id: placeholder_id,
+						\ })
+			let s:placeholder2instance[placeholder_id] = instance
+
+			if placeholder.number == first_placeholder
+				call s:SelectText(placeholder.lnum, placeholder.col,
+							\ placeholder.end_lnum, placeholder.end_col)
+			endif
+		endfor
+
+		eval b:snippet_stack->add(instance)
+		return
 	endif
 
 	call s:JumpForward()
 endfunction
 
+function s:PopActiveSnippet() abort
+	if b:snippet_stack->empty() | throw 'Popping empty stack?' | endif
+	echom 'Popping currently active snippet'
+	let instance = b:snippet_stack->remove(-1)
+
+	for placeholder_id in range(instance.first_placeholder_id,
+				\ instance.first_placeholder_id + instance.num_placeholders - 1)
+		call prop_remove(#{id: placeholder_id, all: 1})
+		eval s:placeholder2instance->remove(placeholder_id)
+	endfor
+endfunction
+
+" Return whether placeholder {id} belongs to snippet {instance}.
+function s:HasPlaceholder(instance, id) abort
+	return a:instance.first_placeholder_id <= a:id
+				\ && a:instance.first_placeholder_id + a:instance.num_placeholders - 1 >= a:id
+endfunction
+
+function s:PopUntilBecomesCurrent(id)
+	while !(b:snippet_stack[-1]->s:HasPlaceholder(a:id))
+		call s:PopActiveSnippet()
+	endwhile
+endfunction
+
+" Return all placeholder properties that contain the cursor.
+function s:CurrentPlaceholder(lnum, ...) abort
+	let col = a:000->get(0, -1) " Second argument is optionally a column
+
+	let props = prop_list(a:lnum)->filter({_, v -> v.type ==# 'placeholder'})
+
+	if col != -1
+		eval props->filter({_, v -> v.col <= col && v.col + v.length >= col})
+	endif
+
+	" Sort after specificity
+	eval props->sort({a, b -> b.id - a.id})
+
+	return props
+endfunction
+
+let s:NextPlaceholderId = {id, instance -> id >= instance.num_placeholders - 1
+			\ ? 0 : id + 1}
+
 function s:JumpForward(...) abort
-	let opts = a:0 >= 1 ? a:1 : {}
+	let opts = a:000->get(0, {})
 	let dry_run = opts->get('dry_run', 0)
 
-	let prop = {}
-	while prop->empty()
-		" If there are no active snippet instances
-		if b:snippet_stack->empty()
-			return 0
-		endif
-
+	let current_props = s:CurrentPlaceholder(line('.'), col('.'))
+	echom current_props
+	for placeholder_prop in current_props
+		call s:PopUntilBecomesCurrent(placeholder_prop.id)
 		let current_instance = b:snippet_stack[-1]
-		let next_placeholder = current_instance.next_placeholder
+		let number = placeholder_prop.id - current_instance.first_placeholder_id
 
-		" Search forward from cursor for tab stop
-		" FIXME Cannot provide a type='placeholder' here because it is an OR...
-		let prop = prop_find(#{
-					\ id: current_instance.first_placeholder_id + next_placeholder,
-					\ skipstart: 0,
-					\ }, 'f')
+		while 1
+			let number = s:NextPlaceholderId(number, current_instance)
+			" Search forward/backward from cursor for tab stop
+			" TODO optimze direction
+			for direction in ['f', 'b']
+				" FIXME Cannot provide a type='placeholder' here because it is an OR...
+				let prop = prop_find(#{
+							\ id: current_instance.first_placeholder_id + number,
+							\ skipstart: 0,
+							\ }, direction)
+				if !empty(prop)
+					" Found property to jump to!
+					if dry_run | return 1 | endif
 
-		" If just looking for if we can jump: Report true
-		if !empty(prop) && dry_run | return 1 | endif
+					" If jumping to last placeholder: Snippet is done!
+					if number == 0 | call s:PopActiveSnippet() | endif
 
-		" Increment the next placeholder variable
-		if next_placeholder == 0
-			eval b:snippet_stack->remove(-1) " Pop current snippet instance
-		else
-			let current_instance.next_placeholder =
-						\ next_placeholder >= current_instance.num_placeholders - 1
-						\ ? 0 : next_placeholder + 1
-		endif
-	endwhile
+					echom 'Jumping to prop:' prop
+					call s:SelectProp(prop) " Leave user editing the next tab stop
 
-	" Found the property to jump to!
-	echom 'Jumping to prop:' prop
+					return 1
+				endif
+			endfor
+		endwhile
+	endfor
 
-	" Leave user editing the next tab stop
-	let save_virtualedit = &virtualedit
-	try
-		set virtualedit=onemore
-		call cursor(prop.lnum, prop.col) " Position cursor at start
-		let zero_len = prop.length == 0
-		if zero_len
-			startinsert
-		else
-			execute 'normal! gh' | " Start Select mode
-			call cursor(prop.lnum, prop.col + prop.length) " Position cursor at end
-			execute "normal! \<C-O>\<C-H>" | " Go back one char
-		endif
-	finally
-		let &virtualedit = save_virtualedit
-	endtry
+	return 0
 endfunction
 
 " {text} is a List of lines
@@ -179,19 +251,23 @@ function s:ReadSnippetBody(text) abort
 	let num_placeholders = 0
 	let has_placeholder_zero = 0
 
+	" TODO Allow multiline patterns
 	function! s:ParseLine(i, line) abort closure
 		let result = []
 		let line = a:line
 		while 1
 			let res = matchlist(line, '\([^$]*\)\%($\%({\(\d\+\)\%(:\([^}]*\)\)\?}\)\(.*\)\)\?')
-			echom res
 			let [match, before, number, initial, after; rest] = res
 			if empty(match) | break | endif
 			if !empty(before)
 				eval result->add(#{type: 'text', text: before})
 			endif
 			if !empty(number)
-				eval result->add(#{type: 'placeholder', id: str2nr(number), initial: initial})
+				eval result->add(#{
+							\ type: 'placeholder',
+							\ id: str2nr(number),
+							\ initial: s:ParseContent([initial]),
+							\ })
 				let num_placeholders += 1
 				if number == 0
 					let has_placeholder_zero = 1
@@ -202,11 +278,15 @@ function s:ReadSnippetBody(text) abort
 		return result
 	endfunction
 
-	let result = a:text->copy()->map(funcref('s:ParseLine'))
+	function! s:ParseContent(text) abort
+		return a:text->copy()->map(funcref('s:ParseLine'))
+	endfunction
+
+	let result = s:ParseContent(a:text)
 
 	" Add tab stop after snippet
 	if !has_placeholder_zero
-		eval result[-1]->add(#{type: 'placeholder', id: 0, initial: ''})
+		eval result[-1]->add(#{type: 'placeholder', id: 0, initial: []})
 		let num_placeholders += 1
 	endif
 
@@ -228,16 +308,15 @@ function s:ReadSnippetBody(text) abort
 				\ num_placeholders: num_placeholders,
 				\ placeholderOrder: placeholderOrder,
 				\ }
-}
 endfunction
 
-let snippetDef2 =<< trim END
-	console.log(${1:foo})fesfe
+let snippetDef =<< trim END
+	console.log(${3:hej}, ${1:foo}, ${2:tree}, ${4:test}, ${5:fekj})fesfe
 END
 
-let snippetDef =<< trim END
-	/begin{${1:align}}
-		${0}
+let snippetDef2 =<< trim END
+	/begin{${0:align}}
+		${1}
 	/end{fin}
 END
 
@@ -261,8 +340,8 @@ function s:Listener(bufnr, start, end, added, changes) abort
 			let props = prop_list(lnum)->filter({_, v -> v.type ==# 'placeholder'})
 			if props->empty()
 				" TODO Only remove active snippet, not all of them
-				echom 'removed'
-				call prop_remove(#{type: 'placeholder'})
+				echom 'pop because listener'
+				call s:PopActiveSnippet()
 				break
 			endif
 		endfor
