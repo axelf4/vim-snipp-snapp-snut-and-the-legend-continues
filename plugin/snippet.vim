@@ -88,8 +88,7 @@ function s:ExpandOrJump(...) abort
 		let [_, lnum, col; rest] = getcurpos()
 		let col -= 2 " Take care of foo
 
-		let snippet = s:ReadSnippetBody(g:snippetDef)
-		let placeholders = []
+		let snippet = s:ReadSnippets(g:snippetDef)[0]
 
 		let builder = #{col: col, lnum: lnum, text: [""]}
 		let indent = getline(lnum)->matchstr('^\s*')
@@ -97,35 +96,27 @@ function s:ExpandOrJump(...) abort
 			let self.text[-1] ..= a:string
 			let self.col += a:string->len()
 		endfunction
-		function builder.newLine() abort closure
+		function builder.new_line() abort closure
 			eval self.text->add(indent)
 			let self.lnum += 1
 			let self.col = 1 + indent->len()
 		endfunction
-
-		echom snippet.content
+		let placeholders = []
 
 		function! s:HandleContent(content) abort closure
-			let first = 1
-			for eline in a:content
-				if !first | call builder.newLine() | endif
-				let first = 0
-
-				for item in eline
-					if item.type ==# 'text'
-						call builder.append(item.text)
-					elseif item.type ==# 'placeholder'
-						let [start_lnum, start_col] = [builder.lnum, builder.col]
-						call s:HandleContent(item.initial)
-						eval placeholders->add(#{
-									\ lnum: start_lnum, col: start_col,
-									\ end_lnum: builder.lnum, end_col: builder.col,
-									\ number: item.id,
-									\ })
-					else
-						throw 'Bad type'
-					endif
-				endfor
+			for item in a:content
+				if item.type ==# 'text'
+					call builder.append(item.content)
+					if item->get('is_eol', 0) | call builder.new_line() | endif
+				elseif item.type ==# 'placeholder'
+					let [start_lnum, start_col] = [builder.lnum, builder.col]
+					call s:HandleContent(item.initial)
+					eval placeholders->add(#{
+								\ lnum: start_lnum, col: start_col,
+								\ end_lnum: builder.lnum, end_col: builder.col,
+								\ number: item.number,
+								\ })
+				else | throw 'Bad type' | endif
 			endfor
 		endfunction
 		call s:HandleContent(snippet.content)
@@ -189,7 +180,6 @@ endfunction
 " Return all placeholder properties that contain the cursor.
 function s:CurrentPlaceholder(lnum, ...) abort
 	let col = a:000->get(0, -1) " Second argument is optionally a column
-
 	let props = prop_list(a:lnum)->filter({_, v -> v.type ==# 'placeholder'})
 
 	if col != -1
@@ -246,82 +236,151 @@ function s:JumpForward(...) abort
 endfunction
 
 " {text} is a List of lines
-function s:ReadSnippetBody(text) abort
-	let num_placeholders = 0
-	let has_placeholder_zero = 0
+function s:ReadSnippets(text) abort
+	let lexer = #{text: a:text, lnum: 0, col: 0, queue: [], in_snippet: 0}
+	function lexer.next_symbol() abort
+		while self.queue->empty()
+			if self.lnum >= self.text->len() | return | endif
+			let line = self.text[self.lnum]
 
-	" TODO Allow multiline patterns
-	function! s:ParseLine(i, line) abort closure
-		let result = []
-		let line = a:line
-		while 1
-			let res = matchlist(line, '\([^$]*\)\%($\%({\(\d\+\)\%(:\([^}]*\)\)\?}\)\(.*\)\)\?')
-			let [match, before, number, initial, after; rest] = res
-			if empty(match) | break | endif
-			if !empty(before)
-				eval result->add(#{type: 'text', text: before})
+			if !self.in_snippet
+				if line =~# '^\s*$\|^#'
+					let end = line->len() " Ignore line
+				else
+					let res = line->matchlist('^snippet')
+					if res->empty() | throw 'Bad line ' .. line | endif
+					let [match; rest] = res
+					let end = match->len()
+					eval self.queue->add(#{type: 'startsnippet'})
+					let self.in_snippet = 1
+				endif
+
+				let self.lnum += 1
+				continue
 			endif
-			if !empty(number)
-				eval result->add(#{
-							\ type: 'placeholder',
-							\ id: str2nr(number),
-							\ initial: s:ParseContent([initial]),
-							\ })
-				let num_placeholders += 1
-				if number == 0
-					let has_placeholder_zero = 1
+
+			" TODO Allow escape sequences
+			" let res = matchstrpos(line, '\%(${\d\+:\?\|{\|}\|$\)', self.col)
+			let res = line->matchstrpos('${\d\+:\?\|{\|}\|endsnippet$\|$', self.col)
+			let [match, start, end] = res
+
+			let before = line->strpart(self.col, start - self.col)
+			if !empty(before) | eval self.queue->add(#{type: 'text', content: before}) | endif
+
+			if !empty(match)
+				if match[0] == '{' || match[0] == '}'
+					eval self.queue->add(#{type: match})
+				elseif match[0] == '$'
+					eval self.queue->add(#{
+								\ type: 'placeholder',
+								\ number: +matchstr(match, '\d\+'),
+								\ has_inital: match =~# ':$',
+								\ })
+				elseif match ==# 'endsnippet'
+					eval self.queue->add(#{type: 'endsnippet'})
+					let self.in_snippet = 0
+				else
+					throw 'Strange match?: "' .. match .. '"'
 				endif
 			endif
-			let line = after
+
+			let self.col = end
+			if end >= line->len()
+				let self.lnum += 1
+				let self.col = 0
+				if self.in_snippet | eval self.queue->add(#{type: 'text', content: '', is_eol: 1}) | endif
+			endif
+		endwhile
+	endfunction
+
+	function! lexer.accept(type) abort
+		if self.queue->empty() | call self.next_symbol() | endif
+		if self.queue->empty() | return 0 | endif
+		if self.queue[0].type ==# a:type
+			return self.queue->remove(0)
+		endif
+		return 0
+	endfunction
+
+	function! lexer.expect(type) abort
+		let token = self.accept(a:type)
+		if token is 0 | throw 'Expected type: ' .. a:type .. ', found other' | endif
+	endfunction
+
+	" Parse a list of snippet definitions.
+	"
+	" Uses a recursive descent parser.
+	function! s:Parse() abort closure
+		let snippets = []
+		while 1
+			let token = lexer.accept('startsnippet')
+			if token is 0 | break | endif
+
+			let has_placeholder_zero = 0
+
+			function! s:ParsePlaceholder() abort closure
+				let token = lexer.accept('placeholder')
+				if token is 0 | return 0 | endif
+				let placeholder = #{type: 'placeholder', number: token.number,
+							\ initial: token.has_inital ? s:ParseContent() : [],}
+				if placeholder.number == 0 | let has_placeholder_zero = 1 | endif
+				call lexer.expect('}')
+				return placeholder
+			endfunction
+
+			let content = s:ParseContent()
+			" Remove last EOL
+			if !empty(content) && content[-1]->get('is_eol', 0) | eval content->remove(-1) | endif
+			" TODO Add tab stop #0 after snippet if needed
+			" TODO Synthesize order of placeholders and mirrors
+
+			call lexer.expect('endsnippet')
+			eval snippets->add(#{content: content})
+		endwhile
+		return snippets
+	endfunction
+
+	" Parse the content of a snippet.
+	function! s:ParseContent() abort closure
+		let result = []
+		while 1
+			let item = lexer.accept('text')
+			if item is 0 | let item = s:ParsePlaceholder() | endif
+			if item is 0 | let item = s:ParseBracketPair() | endif
+			if item is 0 | break | endif
+			eval result->add(item)
 		endwhile
 		return result
 	endfunction
 
-	function! s:ParseContent(text) abort
-		return a:text->copy()->map(funcref('s:ParseLine'))
+	function! s:ParseBracketPair() abort closure
+		let token = lexer.accept('{')
+		if token is 0 | return 0 | endif
+		let result = s:ParseContent()
+		eval result->insert(#{type: 'text', content: '{'}, 0)
+		eval result->add(#{type: 'text', content: '}'})
+		call lexer.expect('}')
+		return result
 	endfunction
 
-	let result = s:ParseContent(a:text)
-
-	" Add tab stop after snippet
-	if !has_placeholder_zero
-		eval result[-1]->add(#{type: 'placeholder', id: 0, initial: []})
-		let num_placeholders += 1
-	endif
-
-	" Synthesize order of placeholders and mirrors
-	let placeholderOrder = repeat([-1], num_placeholders)
-	let i = 0
-	for eline in result
-		for item in eline
-			if item.type ==# 'placeholder'
-				if placeholderOrder[item.id] != -1 | throw 'Duplicate placeholders' | endif
-				let placeholderOrder[item.id] = i
-				let i += 1
-			endif
-		endfor
-	endfor
-
-	return #{
-				\ content: result,
-				\ num_placeholders: num_placeholders,
-				\ placeholderOrder: placeholderOrder,
-				\ }
+	return s:Parse()
 endfunction
 
 let snippetDef =<< trim END
-	console.log(${3:hej}, ${1:foo}, ${2:tree}, ${4:test}, ${5:fekj})fesfe
-END
+	snippet
+	console.log(${3:hej}, ${1:foo}, ${2:tree}, ${4:test}, ${5:fekj})fesfe${0}
+	endsnippet
 
-let snippetDef2 =<< trim END
+	snippet
 	/begin{${0:align}}
 		${1}
 	/end{fin}
+	endsnippet
 END
 
 inoremap <script> <Plug>SnipExpandOrJump <Esc>:call <SID>ExpandOrJump()<CR>
 
-" Can use <C-R>= in insmode to not move cursor
+" Can use <C-R>= in insmode to not move cursor?
 imap <unique> <expr> <Tab> <SID>ShouldTrigger() ? "\<Plug>SnipExpandOrJump"
 			\ : "\<Tab>"
 
@@ -334,21 +393,21 @@ function s:Listener(bufnr, start, end, added, changes) abort
 		" Skip deletions since no efficient way to know if snippet was deleted
 		if change.added < 0 | continue | endif
 
-		for lnum in range(change.lnum, change.end + change.added - 1)
-			" If the change was not to active placeholder: Quit current snippet
-			let props = prop_list(lnum)->filter({_, v -> v.type ==# 'placeholder'})
-			while !(b:snippet_stack->empty())
-				let found = 0
+		" If the change was not to active placeholder: Quit current snippet
+		let found = 0
+		while !(b:snippet_stack->empty())
+			for lnum in range(change.lnum, change.end + change.added - 1)
+				let props = prop_list(lnum)->filter({_, v -> v.type ==# 'placeholder'})
 				for prop in props
 					if b:snippet_stack[-1]->s:HasPlaceholder(prop.id)
 						let found = 1
-						break
+						return
 					endif
 				endfor
-				if found | break | endif
-				call s:PopActiveSnippet()
-			endwhile
-		endfor
+			endfor
+			if found | break | endif
+			call s:PopActiveSnippet()
+		endwhile
 	endfor
 endfunction
 
