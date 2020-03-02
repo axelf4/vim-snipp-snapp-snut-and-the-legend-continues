@@ -331,7 +331,10 @@ function s:ReadSnippets(text) abort
 			let content = s:ParseContent()
 			" Remove last EOL
 			if !empty(content) && content[-1]->get('is_eol', 0) | eval content->remove(-1) | endif
-			" TODO Add tab stop #0 after snippet if needed
+			" Add tab stop #0 after snippet if needed
+			if !has_placeholder_zero
+				eval content->add(#{type: 'placeholder', number: 0, initial: []})
+			endif
 			" TODO Synthesize order of placeholders and mirrors
 
 			call lexer.expect('endsnippet')
@@ -368,7 +371,7 @@ endfunction
 
 let snippetDef =<< trim END
 	snippet
-	console.log(${3:hej}, ${1:foo}, ${2:tree}, ${4:test}, ${5:fekj})fesfe${0}
+	console.log(${3:hej}, ${1:foo}, ${2:tree}, ${4:test}, ${5:fekj})fesfe
 	endsnippet
 
 	snippet
