@@ -4,16 +4,14 @@ if !(has('textprop') && has("patch-8.2.324"))
 endif
 
 highlight Placeholder ctermbg=darkblue
-
-call prop_type_add('placeholder', #{
-			\ highlight: 'Placeholder',
-			\ start_incl: 1,
-			\ end_incl: 1,
-			\ })
+call prop_type_add('placeholder', #{highlight: 'Placeholder', start_incl: 1, end_incl: 1})
+highlight Mirror ctermbg=darkgreen
+call prop_type_add('mirror', #{highlight: 'Mirror', start_incl: 1, end_incl: 1})
 
 let s:next_placeholder_id = 0
 " Map from placeholder ID:s to their respective snippet instances.
 let s:placeholder2instance = {}
+let g:placeholder_values = {} " FIXME
 
 " Replace the specified range with the given text.
 "
@@ -40,21 +38,10 @@ function s:Edit(lnum, col, end_lnum, end_col, text) abort
 		call append(a:lnum, repeat([''], a:text->len() - 2))
 		eval a:text[1:-2]->setline(a:lnum + 1)
 	finally
-		" TODO: Better to leave cursor at start?
+		" TODO: Better to not restore cursor?
 		call setpos('.', save_cursor)
 		let &selection = save_selection
 	endtry
-endfunction
-
-function s:ShouldTrigger() abort
-	let s:should_expand = 0
-	let cword = matchstr(getline('.'), '\v\w+%' . col('.') . 'c')
-	if cword ==# 'fin'
-		let s:should_expand = 1
-		return 1
-	endif
-
-	return s:JumpForward(#{dry_run: 1}) " Return whether can jump forward
 endfunction
 
 function s:SelectText(lnum, col, end_lnum, end_col) abort
@@ -80,6 +67,23 @@ function s:SelectProp(prop) abort
 	call s:SelectText(a:prop.lnum, a:prop.col, a:prop.lnum, a:prop.col + a:prop.length)
 endfunction
 
+" Returns the text content of the textprop {prop}.
+function s:PropContent(prop, lnum) abort
+	" TODO Handle multiline props
+	return getline(a:lnum)->strpart(a:prop.col - 1, a:prop.length)
+endfunction
+
+function s:ShouldTrigger() abort
+	let s:should_expand = 0
+	let cword = matchstr(getline('.'), '\v\w+%' . col('.') . 'c')
+	if cword ==# 'fin'
+		let s:should_expand = 1
+		return 1
+	endif
+
+	return s:JumpForward(#{dry_run: 1}) " Return whether can jump forward
+endfunction
+
 " Try to expand a snippet or jump to the next tab stop.
 "
 " Returns false if failed.
@@ -101,7 +105,7 @@ function s:ExpandOrJump(...) abort
 			let self.lnum += 1
 			let self.col = 1 + indent->len()
 		endfunction
-		let placeholders = []
+		let [placeholders, mirrors] = [[], []]
 
 		function! s:HandleContent(content) abort closure
 			for item in a:content
@@ -111,11 +115,19 @@ function s:ExpandOrJump(...) abort
 				elseif item.type ==# 'placeholder'
 					let [start_lnum, start_col] = [builder.lnum, builder.col]
 					call s:HandleContent(item.initial)
+					" TODO Reach some fixpoint solution?
+					let g:placeholder_values[item.number] = "hejpådig"
 					eval placeholders->add(#{
 								\ lnum: start_lnum, col: start_col,
 								\ end_lnum: builder.lnum, end_col: builder.col,
 								\ number: item.number,
 								\ })
+				elseif item.type ==# 'mirror'
+					let text = eval(item.value)
+					let [start_lnum, start_col] = [builder.lnum, builder.col]
+					call builder.append(text)
+					eval mirrors->add(#{lnum: start_lnum, col: start_col,
+								\ end_lnum: builder.lnum, end_col: builder.col})
 				else | throw 'Bad type' | endif
 			endfor
 		endfunction
@@ -124,13 +136,15 @@ function s:ExpandOrJump(...) abort
 		call s:Edit(lnum, col, lnum, col + 3, builder.text)
 
 		let first_placeholder_id = s:next_placeholder_id
-		let s:next_placeholder_id += placeholders->len()
+		let first_mirror_id = first_placeholder_id + placeholders->len()
+		let s:next_placeholder_id += placeholders->len() + mirrors->len()
 		let instance = #{
+					\ snippet: snippet,
 					\ first_placeholder_id: first_placeholder_id,
-					\ num_placeholders: placeholders->len(),
+					\ first_mirror_id: first_mirror_id,
 					\ }
-		let first_placeholder = placeholders->len() > 1 ? 1 : 0
 
+		let first_placeholder = placeholders->len() > 1 ? 1 : 0
 		for placeholder in placeholders
 			let placeholder_id = first_placeholder_id + placeholder.number
 			call prop_add(placeholder.lnum, placeholder.col, #{
@@ -146,6 +160,15 @@ function s:ExpandOrJump(...) abort
 			endif
 		endfor
 
+		for i in range(mirrors->len())
+			let mirror = mirrors[i]
+			call prop_add(mirror.lnum, mirror.col, #{
+						\ end_lnum: mirror.end_lnum, end_col: mirror.end_col,
+						\ type: 'mirror',
+						\ id: first_mirror_id + i,
+						\ })
+		endfor
+
 		eval b:snippet_stack->add(instance)
 		return 1
 	endif
@@ -159,16 +182,28 @@ function s:PopActiveSnippet() abort
 	let instance = b:snippet_stack->remove(-1)
 
 	for placeholder_id in range(instance.first_placeholder_id,
-				\ instance.first_placeholder_id + instance.num_placeholders - 1)
+				\ instance.first_placeholder_id + instance.snippet.placeholders->len() - 1)
 		call prop_remove(#{id: placeholder_id, all: 1})
 		eval s:placeholder2instance->remove(placeholder_id)
+	endfor
+	for mirror_id in range(instance.first_mirror_id,
+				\ instance.first_mirror_id + instance.snippet.mirrors->len() - 1)
+		call prop_remove(#{id: mirror_id, all: 1})
 	endfor
 endfunction
 
 " Return whether placeholder {id} belongs to snippet {instance}.
 function s:HasPlaceholder(instance, id) abort
 	return a:instance.first_placeholder_id <= a:id
-				\ && a:instance.first_placeholder_id + a:instance.num_placeholders - 1 >= a:id
+				\ && a:instance.first_placeholder_id + a:instance.snippet.placeholders->len() - 1 >= a:id
+endfunction
+
+" Returns index of the snippet instance containing the placeholder with {id}.
+function s:InstanceIdOfPlaceholder(id) abort
+	for i in range(b:snippet_stack->len() - 1, 0, -1)
+		if b:snippet_stack[i]->s:HasPlaceholder(a:id) | return i | endif
+	endfor
+	throw 'Invalid placeholder id: ' .. a:id
 endfunction
 
 function s:PopUntilBecomesCurrent(id)
@@ -192,8 +227,7 @@ function s:CurrentPlaceholder(lnum, ...) abort
 	return props
 endfunction
 
-let s:NextPlaceholderId = {id, instance -> id >= instance.num_placeholders - 1
-			\ ? 0 : id + 1}
+let s:NextPlaceholderId = {id, instance -> id >= instance.snippet.placeholders->len() - 1 ? 0 : id + 1}
 
 function s:JumpForward(...) abort
 	let opts = a:000->get(0, {})
@@ -238,19 +272,19 @@ endfunction
 " {text} is a List of lines
 function s:ReadSnippets(text) abort
 	let lexer = #{text: a:text, lnum: 0, col: 0, queue: [], in_snippet: 0}
+	function lexer.has_eof() abort
+		return self.lnum >= self.text->len()
+	endfunction
 	function lexer.next_symbol() abort
-		while self.queue->empty()
-			if self.lnum >= self.text->len() | return | endif
+		while self.queue->empty() && !self.has_eof()
 			let line = self.text[self.lnum]
 
 			if !self.in_snippet
-				if line =~# '^\s*$\|^#'
-					let end = line->len() " Ignore line
+				if line =~# '^\s*$\|^#' " Ignore line
 				else
 					let res = line->matchlist('^snippet')
 					if res->empty() | throw 'Bad line ' .. line | endif
 					let [match; rest] = res
-					let end = match->len()
 					eval self.queue->add(#{type: 'startsnippet'})
 					let self.in_snippet = 1
 				endif
@@ -261,8 +295,7 @@ function s:ReadSnippets(text) abort
 
 			" TODO Allow escape sequences
 			" let res = matchstrpos(line, '\%(${\d\+:\?\|{\|}\|$\)', self.col)
-			let res = line->matchstrpos('${\d\+:\?\|{\|}\|endsnippet$\|$', self.col)
-			let [match, start, end] = res
+			let [match, start, end] = line->matchstrpos('${\d\+:\?\|{\|}\|`[^`]\+`\|endsnippet$\|$', self.col)
 
 			let before = line->strpart(self.col, start - self.col)
 			if !empty(before) | eval self.queue->add(#{type: 'text', content: before}) | endif
@@ -276,6 +309,8 @@ function s:ReadSnippets(text) abort
 								\ number: +matchstr(match, '\d\+'),
 								\ has_inital: match =~# ':$',
 								\ })
+				elseif match[0] == '`'
+					eval self.queue->add(#{type: 'mirror', value: match[1:-2]})
 				elseif match ==# 'endsnippet'
 					eval self.queue->add(#{type: 'endsnippet'})
 					let self.in_snippet = 0
@@ -316,29 +351,54 @@ function s:ReadSnippets(text) abort
 			let token = lexer.accept('startsnippet')
 			if token is 0 | break | endif
 
-			let has_placeholder_zero = 0
+			let placeholders = {}
+			let placeholder_dependants = {}
+			let mirrors = []
 
 			function! s:ParsePlaceholder() abort closure
 				let token = lexer.accept('placeholder')
 				if token is 0 | return 0 | endif
 				let placeholder = #{type: 'placeholder', number: token.number,
 							\ initial: token.has_inital ? s:ParseContent() : [],}
-				if placeholder.number == 0 | let has_placeholder_zero = 1 | endif
+				let placeholders[placeholder.number] = #{order: placeholders->len()}
 				call lexer.expect('}')
 				return placeholder
+			endfunction
+
+			function! s:ParseMirror() abort closure
+				let token = lexer.accept('mirror')
+				if token is 0 | return 0 | endif
+				let mirror_id = mirrors->len()
+				let dependencies = []
+				function! s:MirrorReplace(m) abort closure
+					let [match, placeholder_number; rest] = a:m
+
+					if !(placeholder_dependants->has_key(placeholder_number))
+						let placeholder_dependants[placeholder_number] = []
+					endif
+					eval placeholder_dependants[placeholder_number]->add(mirror_id)
+					eval dependencies->add(placeholder_number)
+
+					return 'g:placeholder_values[' .. placeholder_number .. ']'
+				endfunction
+				let value = token.value->substitute('$\(\d\+\)', funcref('s:MirrorReplace'), 'g')
+				eval mirrors->add(#{value: value, dependencies: dependencies})
+				return #{type: 'mirror', id: mirror_id, value: value}
 			endfunction
 
 			let content = s:ParseContent()
 			" Remove last EOL
 			if !empty(content) && content[-1]->get('is_eol', 0) | eval content->remove(-1) | endif
 			" Add tab stop #0 after snippet if needed
-			if !has_placeholder_zero
+			if !(placeholders->has_key('0'))
 				eval content->add(#{type: 'placeholder', number: 0, initial: []})
+				let placeholders[0] = #{order: placeholders->len()}
 			endif
-			" TODO Synthesize order of placeholders and mirrors
 
 			call lexer.expect('endsnippet')
-			eval snippets->add(#{content: content})
+			eval snippets->add(#{content: content, placeholders: placeholders, mirrors: mirrors,
+						\ placeholder_dependants: placeholder_dependants,
+						\ })
 		endwhile
 		return snippets
 	endfunction
@@ -350,6 +410,7 @@ function s:ReadSnippets(text) abort
 			let item = lexer.accept('text')
 			if item is 0 | let item = s:ParsePlaceholder() | endif
 			if item is 0 | let item = s:ParseBracketPair() | endif
+			if item is 0 | let item = s:ParseMirror() | endif
 			if item is 0 | break | endif
 			eval result->add(item)
 		endwhile
@@ -371,13 +432,13 @@ endfunction
 
 let snippetDef =<< trim END
 	snippet
-	console.log(${3:hej}, ${1:foo}, ${2:tree}, ${4:test}, ${5:fekj})fesfe
+	console.log(${3:hej}, ${1:foo}, ${2:tree}, ${4:test}, ${5:fekj})`strftime('%c') .. $1`fesfe
 	endsnippet
 
 	snippet
-	/begin{${0:align}}
+	\begin{${0:align}}
 		${1}
-	/end{fin}
+	\end{fin}
 	endsnippet
 END
 
@@ -387,7 +448,9 @@ inoremap <script> <Plug>SnipExpandOrJump <Esc>:call <SID>ExpandOrJump()<CR>
 imap <unique> <expr> <Tab> <SID>ShouldTrigger() ? "\<Plug>SnipExpandOrJump"
 			\ : "\<Tab>"
 
+let s:listener_disabled = 0
 function s:Listener(bufnr, start, end, added, changes) abort
+	if s:listener_disabled | return | endif
 	" Quit early if there are no active snippets
 	if b:snippet_stack->empty() | return | endif
 
@@ -396,21 +459,54 @@ function s:Listener(bufnr, start, end, added, changes) abort
 		" Skip deletions since no efficient way to know if snippet was deleted
 		if change.added < 0 | continue | endif
 
-		" If the change was not to active placeholder: Quit current snippet
-		let found = 0
-		while !(b:snippet_stack->empty())
-			for lnum in range(change.lnum, change.end + change.added - 1)
-				let props = prop_list(lnum)->filter({_, v -> v.type ==# 'placeholder'})
-				for prop in props
-					if b:snippet_stack[-1]->s:HasPlaceholder(prop.id)
-						let found = 1
-						return
-					endif
-				endfor
+		let dirty_mirrors = []
+		let cached_placeholders = {}
+		let max_instance_nr = -1 " Largest snippet instance index seen
+		for lnum in range(change.lnum, change.end + change.added - 1)
+			let props = prop_list(lnum)->filter({_, v -> v.type ==# 'placeholder' && change.col <= v.col + v.length})
+			for prop in props
+				let instance_id = prop.id->s:InstanceIdOfPlaceholder()
+				if instance_id > max_instance_nr | let max_instance_nr = instance_id | endif
+				let instance = b:snippet_stack[instance_id]
+
+				let dependants = instance.snippet.placeholder_dependants->get(prop.id - instance.first_placeholder_id, [])
+				if !empty(dependants)
+					" Store its content and add dependants to list
+					let cached_placeholders[prop.id] = prop->s:PropContent(lnum)
+					echom cached_placeholders[prop.id]
+					eval dirty_mirrors->extend(dependants->copy()->map({i, v -> #{instance: instance, id: v}}))
+				endif
 			endfor
-			if found | break | endif
-			call s:PopActiveSnippet()
-		endwhile
+		endfor
+
+		" If the change was not to active placeholder: Quit current snippet
+		for _ in range(b:snippet_stack->len() - max_instance_nr - 1) | call s:PopActiveSnippet() | endfor
+
+		" TODO Handle case of multiple dependencies
+		function! s:UpdateMirrors(timer) abort closure
+			for dirty in dirty_mirrors
+				let mirror_prop = prop_find(#{
+							\ id: dirty.instance.first_mirror_id + dirty.id,
+							\ lnum: 1,
+							\ })
+				let mirror = dirty.instance.snippet.mirrors[dirty.id]
+				for dependency in mirror.dependencies
+					let g:placeholder_values[dependency] = cached_placeholders[dirty.instance.first_placeholder_id + dependency]
+				endfor
+
+				" Re-evaluate mirror
+				let text = eval(mirror.value)
+				call s:Edit(mirror_prop.lnum, mirror_prop.col, mirror_prop.lnum, mirror_prop.col + mirror_prop.length,
+							\ [text])
+				let s:listener_disabled = 1
+				try
+					call listener_flush()
+				finally
+					let s:listener_disabled = 0
+				endtry
+			endfor
+		endfunction
+		call timer_start(0, funcref('s:UpdateMirrors'))
 	endfor
 endfunction
 
