@@ -23,37 +23,29 @@ function s:Edit(lnum, col, end_lnum, end_col, text) abort
 	if a:end_lnum < a:lnum || (a:lnum == a:end_lnum && a:end_col < a:col)
 		throw 'Start is past end?'
 	endif
+	let [bufnum, lnum, col, _, curswant] = getcurpos()
+	" Replace with first and last line
+	" TODO Escape correctly (Consider using '\='?)
+	execute a:lnum .. 'substitute/' .. ('\%' .. a:col .. 'c') .. '\_.*'
+				\ .. ('\%' .. a:end_lnum .. 'l') .. ('\%' .. a:end_col .. 'c')
+				\ .. '/' .. (a:text->empty() ? '' : a:text[0]
+				\ .. (a:text->len() > 1 ? '\r' .. a:text[-1] : '')) .. '/'
+	" Set middle section
+	call append(a:lnum, repeat([''], a:text->len() - 2))
+	eval a:text[1:-2]->setline(a:lnum + 1)
 
-	let [save_cursor, save_selection] = [getcurpos(), &selection]
-	let [bufnum, lnum, col, _, curswant] = save_cursor
-	try
-		call cursor(a:lnum, a:col) " Position cursor at start
-		set selection=exclusive
-		normal! v
-		call cursor(a:end_lnum, a:end_col) " Position cursor at end
-		" Replace with first and last line
-		execute 'normal! c'
-					\ .. (a:text->empty() ? '' : a:text[0]
-					\ .. (a:text->len() > 1 ? "\<CR>" .. a:text[-1] : ''))
-		" Set middle section
-		call append(a:lnum, repeat([''], a:text->len() - 2))
-		eval a:text[1:-2]->setline(a:lnum + 1)
-
-		" Update cursor position
-		if (a:lnum < lnum || a:lnum == lnum && a:col <= col)
-					\ && (lnum < a:lnum || lnum == a:lnum && col < a:col) " Cursor was inside edit
-			let [lnum, col] = [a:end_lnum, a:end_col] " Move cursor to end of edit
-		elseif a:end_lnum < lnum || a:end_lnum == lnum && a:end_col <= col " Cursor was after edit
-			if a:end_lnum == lnum
-				let col += (a:text->empty() ? 0 : a:text[-1]->len())
-							\ - (a:lnum == a:end_lnum ? a:end_col - a:col : a:end_col - 1)
-			endif
-			let lnum += a:text->len() - (a:end_lnum - a:lnum)
+	" Update cursor position
+	if (a:lnum < lnum || a:lnum == lnum && a:col <= col)
+				\ && (lnum < a:lnum || lnum == a:lnum && col < a:col) " Cursor was inside edit
+		let [lnum, col] = [a:end_lnum, a:end_col] " Move cursor to end of edit
+	elseif a:end_lnum < lnum || a:end_lnum == lnum && a:end_col <= col " Cursor was after edit
+		if a:end_lnum == lnum
+			let col += (a:text->empty() ? 0 : a:text[-1]->len())
+						\ - (a:end_col - (a:lnum == a:end_lnum ? a:col : 1))
 		endif
-	finally
-		call setpos('.', [bufnum, lnum, col, 0, col])
-		let &selection = save_selection
-	endtry
+		let lnum += a:text->len() - (a:end_lnum - a:lnum) - 1
+	endif
+	call setpos('.', [bufnum, lnum, col, 0, col])
 endfunction
 
 function s:SelectText(lnum, col, end_lnum, end_col) abort
@@ -107,7 +99,8 @@ function s:ExpandOrJump(...) abort
 		let snippet = s:ParseSnippets(g:snippetDef)[0]
 
 		let g:placeholder_values = {}
-		" Super suboptimal iteration for a fixed-point
+		" Suboptimal iteration for a fixed-point
+		let cached_placeholders = {}
 		let finished = 0
 		while !finished
 			let finished = 1
@@ -130,6 +123,10 @@ function s:ExpandOrJump(...) abort
 			endfunction
 
 			let [placeholders, mirrors] = [[], []]
+			let instance = #{
+						\ snippet: snippet,
+						\ cached_placeholders: cached_placeholders, dirty_mirrors: {},
+						\ }
 			function! s:HandleContent(content) abort closure
 				for item in a:content
 					if item.type ==# 'text'
@@ -138,21 +135,24 @@ function s:ExpandOrJump(...) abort
 					elseif item.type ==# 'placeholder'
 						let [start_lnum, start_col] = [builder.lnum, builder.col]
 						call s:HandleContent(item.initial)
-						let g:placeholder_values[item.number] = builder.get_text(start_lnum, start_col)
-									\ ->join("\n")
+						if !empty(snippet.placeholder_dependants->get(item.number, []))
+							let cached_placeholders[item.number] = builder.get_text(start_lnum, start_col)
+										\ ->join("\n")
+						endif
 						eval placeholders->add(#{
 									\ lnum: start_lnum, col: start_col,
 									\ end_lnum: builder.lnum, end_col: builder.col,
 									\ number: item.number,
 									\ })
 					elseif item.type ==# 'mirror'
-						for dependency in snippet.mirrors[item.id].dependencies
-							if !(g:placeholder_values->has_key(dependency))
+						let mirror = snippet.mirrors[item.id]
+						for dependency in mirror.dependencies
+							if !(cached_placeholders->has_key(dependency))
 								let finished = 0
 								break
 							endif
 						endfor
-						let text = finished ? eval(item.value) : ''
+						let text = finished ? mirror->s:EvalMirror(instance) : ''
 						let [start_lnum, start_col] = [builder.lnum, builder.col]
 						call builder.append(text)
 						eval mirrors->add(#{lnum: start_lnum, col: start_col,
@@ -165,22 +165,16 @@ function s:ExpandOrJump(...) abort
 
 		call s:Edit(lnum, col, lnum, col + 3, builder.text)
 
-		let first_placeholder_id = s:next_placeholder_id
-		let first_mirror_id = first_placeholder_id + placeholders->len()
+		let instance.first_placeholder_id = s:next_placeholder_id
+		let instance.first_mirror_id = instance.first_placeholder_id + placeholders->len()
 		let s:next_placeholder_id += placeholders->len() + mirrors->len()
-		let instance = #{
-					\ snippet: snippet,
-					\ first_placeholder_id: first_placeholder_id,
-					\ first_mirror_id: first_mirror_id,
-					\ }
 
 		let first_placeholder = placeholders->len() > 1 ? 1 : 0
 		for placeholder in placeholders
-			let placeholder_id = first_placeholder_id + placeholder.number
+			let placeholder_id = instance.first_placeholder_id + placeholder.number
 			call prop_add(placeholder.lnum, placeholder.col, #{
 						\ end_lnum: placeholder.end_lnum, end_col: placeholder.end_col,
-						\ type: 'placeholder',
-						\ id: placeholder_id,
+						\ type: 'placeholder', id: placeholder_id,
 						\ })
 			let s:placeholder2instance[placeholder_id] = instance
 
@@ -194,8 +188,7 @@ function s:ExpandOrJump(...) abort
 			let mirror = mirrors[i]
 			call prop_add(mirror.lnum, mirror.col, #{
 						\ end_lnum: mirror.end_lnum, end_col: mirror.end_col,
-						\ type: 'mirror',
-						\ id: first_mirror_id + i,
+						\ type: 'mirror', id: instance.first_mirror_id + i,
 						\ })
 		endfor
 
@@ -489,6 +482,12 @@ endfunction
 
 let snippetDef =<< trim END
 	snippet
+	`'┌' .. repeat('─', 2 + $1->len()) .. '┐'` foo
+	│ ${1:nice box} │
+	`'└' .. repeat('─', 2 + $1->len()) .. '┘'` foo
+	endsnippet
+
+	snippet
 	console.log(${3:hej}, ${1:foo}, `$2`, ${2:tree}, ${4:test}, ${5:fekj})`strftime('%c') .. $1`fesfe
 	endsnippet
 
@@ -516,8 +515,6 @@ function s:Listener(bufnr, start, end, added, changes) abort
 		" Skip deletions since no efficient way to know if snippet was deleted
 		if change.added < 0 | continue | endif
 
-		let dirty_mirrors = []
-		let cached_placeholders = {}
 		let max_instance_nr = -1 " Largest snippet instance index seen
 		for lnum in range(change.lnum, change.end + change.added - 1)
 			let props = prop_list(lnum)->filter({_, v -> v.type ==# 'placeholder' && change.col <= v.col + v.length})
@@ -526,43 +523,54 @@ function s:Listener(bufnr, start, end, added, changes) abort
 				if instance_id > max_instance_nr | let max_instance_nr = instance_id | endif
 				let instance = b:snippet_stack[instance_id]
 
-				let dependants = instance.snippet.placeholder_dependants->get(prop.id - instance.first_placeholder_id, [])
+				let placeholder_number = prop.id - instance.first_placeholder_id
+				let dependants = instance.snippet.placeholder_dependants->get(placeholder_number, [])
 				if !empty(dependants)
+					let new_content = prop->s:PropContent(lnum)
+					if new_content ==# instance.cached_placeholders[placeholder_number] | continue | endif
+					let instance.cached_placeholders[placeholder_number] = new_content
 					" Store its content and add dependants to list
-					let cached_placeholders[prop.id] = prop->s:PropContent(lnum)
-					eval dirty_mirrors->extend(dependants->copy()->map({i, v -> #{instance: instance, id: v}}))
+					for dependant in dependants
+						let instance.dirty_mirrors[dependant] = 1
+					endfor
 				endif
 			endfor
 		endfor
 
 		" If the change was not to active placeholder: Quit current snippet
 		for _ in range(b:snippet_stack->len() - max_instance_nr - 1) | call s:PopActiveSnippet() | endfor
+	endfor
 
-		" TODO Handle case of multiple dependencies
-		function! s:UpdateMirrors(timer) abort closure
-			for dirty in dirty_mirrors
-				let mirror_prop = prop_find(#{
-							\ id: dirty.instance.first_mirror_id + dirty.id,
-							\ lnum: 1,
-							\ })
-				let mirror = dirty.instance.snippet.mirrors[dirty.id]
-				for dependency in mirror.dependencies
-					let g:placeholder_values[dependency] = cached_placeholders[dirty.instance.first_placeholder_id + dependency]
-				endfor
+	call timer_start(0, funcref('s:UpdateMirrors'))
+endfunction
 
-				" Re-evaluate mirror
-				let text = eval(mirror.value)
-				call s:Edit(mirror_prop.lnum, mirror_prop.col, mirror_prop.lnum, mirror_prop.col + mirror_prop.length,
-							\ [text])
-				let s:listener_disabled = 1
-				try
-					call listener_flush()
-				finally
-					let s:listener_disabled = 0
-				endtry
-			endfor
-		endfunction
-		call timer_start(0, funcref('s:UpdateMirrors'))
+function s:EvalMirror(mirror, instance) abort
+	for dependency in a:mirror.dependencies
+		let g:placeholder_values[dependency] = a:instance.cached_placeholders[dependency]
+	endfor
+	return eval(a:mirror.value)
+endfunction
+
+function s:UpdateMirrors(timer) abort
+	for instance in b:snippet_stack
+		for dirty in instance.dirty_mirrors->keys()
+			let mirror = instance.snippet.mirrors[dirty]
+			let mirror_prop = prop_find(#{
+						\ id: instance.first_mirror_id + dirty,
+						\ lnum: 1,
+						\ })
+			let text = mirror->s:EvalMirror(instance)
+
+			let s:listener_disabled = 1
+			try
+				call s:Edit(mirror_prop.lnum, mirror_prop.col, mirror_prop.lnum,
+							\ mirror_prop.col + mirror_prop.length, [text])
+				call listener_flush()
+			finally
+				let s:listener_disabled = 0
+			endtry
+		endfor
+		let instance.dirty_mirrors = {}
 	endfor
 endfunction
 
