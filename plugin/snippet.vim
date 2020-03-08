@@ -1,5 +1,5 @@
 " Vim plugin for snippets
-if !(has('textprop') && has("patch-8.2.324"))
+if !(has('textprop') && has("patch-8.2.324") && has("patch-8.2.357"))
 	throw 'Incompatible Vim version!'
 endif
 
@@ -205,12 +205,12 @@ function s:PopActiveSnippet() abort
 
 	for placeholder_id in range(instance.first_placeholder_id,
 				\ instance.first_placeholder_id + instance.snippet.placeholders->len() - 1)
-		call prop_remove(#{id: placeholder_id, all: 1})
+		call prop_remove(#{id: placeholder_id, type: 'placeholder', both: 1, all: 1})
 		eval s:placeholder2instance->remove(placeholder_id)
 	endfor
 	for mirror_id in range(instance.first_mirror_id,
 				\ instance.first_mirror_id + instance.snippet.mirrors->len() - 1)
-		call prop_remove(#{id: mirror_id, all: 1})
+		call prop_remove(#{id: mirror_id, type: 'mirror', both: 1, all: 1})
 	endfor
 endfunction
 
