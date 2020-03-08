@@ -26,7 +26,7 @@ function s:Edit(lnum, col, end_lnum, end_col, text) abort
 	let [bufnum, lnum, col, _, curswant] = getcurpos()
 	" Replace with first and last line
 	" TODO Escape correctly (Consider using '\='?)
-	execute a:lnum .. 'substitute/' .. ('\%' .. a:col .. 'c') .. '\_.*'
+	execute 'keeppatterns' a:lnum .. 'substitute/' .. ('\%' .. a:col .. 'c') .. '\_.*'
 				\ .. ('\%' .. a:end_lnum .. 'l') .. ('\%' .. a:end_col .. 'c')
 				\ .. '/' .. (a:text->empty() ? '' : a:text[0]
 				\ .. (a:text->len() > 1 ? '\r' .. a:text[-1] : '')) .. '/'
@@ -506,7 +506,6 @@ imap <unique> <expr> <Tab> <SID>ShouldTrigger() ? "\<Plug>SnipExpandOrJump"
 
 let s:listener_disabled = 0
 function s:Listener(bufnr, start, end, added, changes) abort
-	if s:listener_disabled | return | endif
 	" Quit early if there are no active snippets
 	if b:snippet_stack->empty() | return | endif
 
@@ -517,8 +516,8 @@ function s:Listener(bufnr, start, end, added, changes) abort
 
 		let max_instance_nr = -1 " Largest snippet instance index seen
 		for lnum in range(change.lnum, change.end + change.added - 1)
-			let props = prop_list(lnum)->filter({_, v -> v.type ==# 'placeholder' && change.col <= v.col + v.length})
-			for prop in props
+			for prop in prop_list(lnum)
+				if prop.type !=# 'placeholder' || prop.col + prop.length < change.col | continue | endif
 				let instance_id = prop.id->s:InstanceIdOfPlaceholder()
 				if instance_id > max_instance_nr | let max_instance_nr = instance_id | endif
 				let instance = b:snippet_stack[instance_id]
@@ -537,8 +536,10 @@ function s:Listener(bufnr, start, end, added, changes) abort
 			endfor
 		endfor
 
-		" If the change was not to active placeholder: Quit current snippet
-		for _ in range(b:snippet_stack->len() - max_instance_nr - 1) | call s:PopActiveSnippet() | endfor
+		if !s:listener_disabled
+			" If the change was not to active placeholder: Quit current snippet
+			for _ in range(b:snippet_stack->len() - max_instance_nr - 1) | call s:PopActiveSnippet() | endfor
+		endif
 	endfor
 
 	call timer_start(0, funcref('s:UpdateMirrors'))
@@ -561,17 +562,17 @@ function s:UpdateMirrors(timer) abort
 						\ })
 			let text = mirror->s:EvalMirror(instance)
 
-			let s:listener_disabled = 1
-			try
-				call s:Edit(mirror_prop.lnum, mirror_prop.col, mirror_prop.lnum,
-							\ mirror_prop.col + mirror_prop.length, [text])
-				call listener_flush()
-			finally
-				let s:listener_disabled = 0
-			endtry
+			call s:Edit(mirror_prop.lnum, mirror_prop.col, mirror_prop.lnum,
+						\ mirror_prop.col + mirror_prop.length, [text])
 		endfor
 		let instance.dirty_mirrors = {}
 	endfor
+	let s:listener_disabled = 1
+	try
+		call listener_flush()
+	finally
+		let s:listener_disabled = 0
+	endtry
 endfunction
 
 function s:OnBufEnter() abort
