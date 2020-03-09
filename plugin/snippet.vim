@@ -12,6 +12,7 @@ let s:next_placeholder_id = 0
 " Map from placeholder ID:s to their respective snippet instances.
 let s:placeholder2instance = {}
 let g:placeholder_values = {} " TODO Temporarily used for mirror evaluation
+let s:snippets_by_ft = {}
 
 " Replace the specified range with the given text.
 "
@@ -77,6 +78,24 @@ function s:PropContent(prop, lnum) abort
 	return getline(a:lnum)->strpart(a:prop.col - 1, a:prop.length)
 endfunction
 
+function s:Flatten(list) abort
+	let result = []
+	for item in a:list | eval result->extend(item) | endfor
+	return result
+endfunction
+
+function s:FlatMap(list, F) abort
+	let result = []
+	for item in a:list | eval result->extend(a:F(item)) | endfor
+	return result
+endfunction
+
+" Tests if every element of {list} matches the predicate {F}.
+function s:All(list, F) abort
+	for item in a:list | if !a:F(item) | return 0 | endif | endfor
+	return 1
+endfunction
+
 function s:ShouldTrigger() abort
 	let s:should_expand = 0
 	let cword = matchstr(getline('.'), '\v\w+%' . col('.') . 'c')
@@ -96,7 +115,7 @@ function s:ExpandOrJump(...) abort
 		let [_, lnum, col; rest] = getcurpos()
 		let col -= 2 " Take care of foo
 
-		let snippet = s:ParseSnippets(g:snippetDef)[0]
+		let snippet = s:SnippetFiletypes()->s:FlatMap({ft -> s:snippets_by_ft[ft]})[0]
 
 		let g:placeholder_values = {}
 		" Suboptimal iteration for a fixed-point
@@ -146,12 +165,9 @@ function s:ExpandOrJump(...) abort
 									\ })
 					elseif item.type ==# 'mirror'
 						let mirror = snippet.mirrors[item.id]
-						for dependency in mirror.dependencies
-							if !(cached_placeholders->has_key(dependency))
-								let finished = 0
-								break
-							endif
-						endfor
+						if !(mirror.dependencies->s:All({v -> cached_placeholders->has_key(v)}))
+							let finished = 0
+						endif
 						let text = finished ? mirror->s:EvalMirror(instance) : ''
 						let [start_lnum, start_col] = [builder.lnum, builder.col]
 						call builder.append(text)
@@ -301,8 +317,7 @@ function s:ParseSnippets(text) abort
 			let line = self.text[self.lnum]
 
 			if !self.in_snippet
-				if line =~# '^\s*$\|^#' " Ignore line
-				else
+				if line !~# '^\s*$\|^#' " Ignore empty lines and comment
 					let res = line->matchlist('^snippet')
 					if res->empty() | throw 'Bad line ' .. line | endif
 					let [match; rest] = res
@@ -480,29 +495,12 @@ function s:ParseSnippets(text) abort
 	return snippets
 endfunction
 
-let snippetDef =<< trim END
-	snippet
-	`'┌' .. repeat('─', 2 + $1->len()) .. '┐'` foo
-	│ ${1:nice box} │
-	`'└' .. repeat('─', 2 + $1->len()) .. '┘'` foo
-	endsnippet
-
-	snippet
-	console.log(${3:hej}, ${1:foo}, `$2`, ${2:tree}, ${4:test}, ${5:fekj})`strftime('%c') .. $1`fesfe
-	endsnippet
-
-	snippet
-	\begin{${0:align}}
-		${1}
-	\end{fin}
-	endsnippet
-END
-
 inoremap <script> <Plug>SnipExpandOrJump <Esc>:call <SID>ExpandOrJump()<CR>
 
 " Can use <C-R>= in insmode to not move cursor?
 imap <unique> <expr> <Tab> <SID>ShouldTrigger() ? "\<Plug>SnipExpandOrJump"
 			\ : "\<Tab>"
+" TODO Jump in select mode snoremap <unique> <Tab>
 
 let s:listener_disabled = 0
 function s:Listener(bufnr, start, end, added, changes) abort
@@ -575,6 +573,8 @@ function s:UpdateMirrors(timer) abort
 	endtry
 endfunction
 
+let s:SnippetFiletypes = {-> split(&filetype, '\.') + ['all']}
+
 function s:OnBufEnter() abort
 	if exists('b:snippet_stack') | return | endif
 	let b:snippet_stack = []
@@ -582,9 +582,38 @@ function s:OnBufEnter() abort
 	call listener_add(funcref('s:Listener'))
 endfunction
 
+function s:SourceSnippetFile() abort
+	let file = expand('<afile>:p')
+	let ft = file->fnamemodify(':t:r')
+	let snippets = readfile(file)->s:ParseSnippets()
+	let s:snippets_by_ft[ft] = snippets
+endfunction
+
+let s:SourcesForFiletype = {ft -> printf('SnippSnapp/**/%s.snippets', ft)->globpath(&runtimepath, 1, 1)}
+
+function s:EnsureSnippetsLoaded(filetype) abort
+	" TODO Handle multiple files for single filetype
+	for snippet_file in a:filetype->split('\.')->filter({_, v -> !(s:snippets_by_ft->has_key(v))})
+				\ ->s:FlatMap({ft -> s:SourcesForFiletype(ft)})
+		execute 'source' snippet_file
+	endfor
+endfunction
+
+function s:SnippetEdit(mods) abort
+	let file = s:SnippetFiletypes()->s:FlatMap({ft -> s:SourcesForFiletype(ft)})->get(0,
+				\ printf('%s/%s.snippets', &runtimepath->split(',')[0], s:SnippetFiletypes()[0]))
+	execute a:mods 'split' file
+endfunction
+
+command -bar SnippetEdit call s:SnippetEdit(<q-mods>)
+
 augroup snippet
 	autocmd!
 	autocmd BufEnter * call s:OnBufEnter()
+	autocmd SourceCmd *.snippets call s:SourceSnippetFile()
+	autocmd FileType * call s:EnsureSnippetsLoaded('<amatch>')
 augroup END
+
+call s:EnsureSnippetsLoaded('all')
 
 nnoremap <F8> :echom prop_list(line('.'))<CR>
