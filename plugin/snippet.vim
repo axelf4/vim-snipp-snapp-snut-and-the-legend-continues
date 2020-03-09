@@ -49,22 +49,18 @@ function s:Edit(lnum, col, end_lnum, end_col, text) abort
 	call setpos('.', [bufnum, lnum, col, 0, col])
 endfunction
 
+" Start Select mode with the specified area.
+"
+" The implementation is terrible to support CTRL-R =.
 function s:SelectText(lnum, col, end_lnum, end_col) abort
+	" TODO Handle all cases of &selection
 	let save_virtualedit = &virtualedit
-	try
-		set virtualedit=onemore
-		call cursor(a:lnum, a:col) " Position cursor at start
-		let zero_len = a:lnum == a:end_lnum && a:col == a:end_col
-		if zero_len
-			startinsert
-		else
-			execute 'normal! gh' | " Start Select mode
-			call cursor(a:end_lnum, a:end_col) " Position cursor at end
-			execute "normal! \<C-O>\<C-H>" | " Go back one char
-		endif
-	finally
-		let &virtualedit = save_virtualedit
-	endtry
+	let zero_len = a:lnum == a:end_lnum && a:col == a:end_col
+	call feedkeys((mode() !=# 'n' ? "\<Esc>" : '')
+				\ .. ':set virtualedit=onemore | call cursor(' .. a:lnum .. ',' .. a:col .. ")\<CR>"
+				\ .. (zero_len ? "i\<C-O>:set virtualedit=" .. save_virtualedit .. "\<CR>"
+				\ : "v:\<C-U>call cursor(" .. a:end_lnum .. ',' .. a:end_col .. ")\<CR>\<C-H>:set virtualedit=" .. save_virtualedit .. "\<CR>v`<o\<C-G>"),
+				\ 'n')
 endfunction
 
 function s:SelectProp(prop) abort
@@ -96,123 +92,125 @@ function s:All(list, F) abort
 	return 1
 endfunction
 
-function s:ShouldTrigger() abort
-	let s:should_expand = 0
-	let cword = matchstr(getline('.'), '\v\w+%' . col('.') . 'c')
-	if cword ==# 'fin'
-		let s:should_expand = 1
-		return 1
-	endif
-
-	return s:JumpForward(#{dry_run: 1}) " Return whether can jump forward
+" Return the snippets whose trigger matches at the cursor and their matches.
+function s:PossibleSnippets() abort
+	let snippets = []
+	let [line, col] = [getline('.'), col('.')]
+	for snippet in s:SnippetFiletypes()->s:FlatMap({ft -> s:snippets_by_ft[ft]})
+		let match = line->matchlist(snippet.trigger .. '\%' .. (col) .. 'c')
+		if !empty(match)
+			eval snippets->add([snippet, match])
+		endif
+	endfor
+	return snippets
 endfunction
 
 " Try to expand a snippet or jump to the next tab stop.
 "
 " Returns false if failed.
-function s:ExpandOrJump(...) abort
-	if s:should_expand
-		let [_, lnum, col; rest] = getcurpos()
-		let col -= 2 " Take care of foo
+function s:ExpandOrJump() abort
+	let possible = s:PossibleSnippets()
+	return !empty(possible) ? s:Expand(possible[0][0], possible[0][1]) : s:Jump()
+endfunction
 
-		let snippet = s:SnippetFiletypes()->s:FlatMap({ft -> s:snippets_by_ft[ft]})[0]
+" Expand {snippet} at the cursor location.
+function s:Expand(snippet, match) abort
+	let [_, lnum, col; rest] = getcurpos()
+	let length = a:match[0]->len()
+	let col -= length
 
-		let g:placeholder_values = {}
-		" Suboptimal iteration for a fixed-point
-		let cached_placeholders = {}
-		let finished = 0
-		while !finished
-			let finished = 1
-			let builder = #{col: col, lnum: lnum, text: [""]}
-			let indent = getline(lnum)->matchstr('^\s*')
-			function builder.append(string) abort
-				let self.text[-1] ..= a:string
-				let self.col += a:string->len()
-			endfunction
-			function builder.new_line() abort closure
-				eval self.text->add(indent)
-				let self.lnum += 1
-				let self.col = 1 + indent->len()
-			endfunction
-			" Returns the text from the specified start position to the end.
-			function builder.get_text(lnum, col) abort
-				let lines = self.text[-1 - (self.lnum - a:lnum):-1]
-				let lines[0] = lines[0]->strpart(a:col - 1)
-				return lines
-			endfunction
+	let cached_placeholders = {}
+	let instance = #{
+				\ snippet: a:snippet, match: a:match,
+				\ cached_placeholders: cached_placeholders, dirty_mirrors: {},
+				\ }
+	" Suboptimal iteration for a fixed-point
+	let finished = 0
+	while !finished
+		let finished = 1
+		let builder = #{col: col, lnum: lnum, text: [""]}
+		let indent = getline(lnum)->matchstr('^\s*')
+		function builder.append(string) abort
+			let self.text[-1] ..= a:string
+			let self.col += a:string->len()
+		endfunction
+		function builder.new_line() abort closure
+			eval self.text->add(indent)
+			let self.lnum += 1
+			let self.col = 1 + indent->len()
+		endfunction
+		" Returns the text from the specified start position to the end.
+		function builder.get_text(lnum, col) abort
+			let lines = self.text[-1 - (self.lnum - a:lnum):-1]
+			let lines[0] = lines[0]->strpart(a:col - 1)
+			return lines
+		endfunction
 
-			let [placeholders, mirrors] = [[], []]
-			let instance = #{
-						\ snippet: snippet,
-						\ cached_placeholders: cached_placeholders, dirty_mirrors: {},
-						\ }
-			function! s:HandleContent(content) abort closure
-				for item in a:content
-					if item.type ==# 'text'
-						call builder.append(item.content)
-						if item->get('is_eol', 0) | call builder.new_line() | endif
-					elseif item.type ==# 'placeholder'
-						let [start_lnum, start_col] = [builder.lnum, builder.col]
-						call s:HandleContent(item.initial)
-						if !empty(snippet.placeholder_dependants->get(item.number, []))
-							let cached_placeholders[item.number] = builder.get_text(start_lnum, start_col)
-										\ ->join("\n")
-						endif
-						eval placeholders->add(#{
-									\ lnum: start_lnum, col: start_col,
-									\ end_lnum: builder.lnum, end_col: builder.col,
-									\ number: item.number,
-									\ })
-					elseif item.type ==# 'mirror'
-						let mirror = snippet.mirrors[item.id]
-						if !(mirror.dependencies->s:All({v -> cached_placeholders->has_key(v)}))
-							let finished = 0
-						endif
-						let text = finished ? mirror->s:EvalMirror(instance) : ''
-						let [start_lnum, start_col] = [builder.lnum, builder.col]
-						call builder.append(text)
-						eval mirrors->add(#{lnum: start_lnum, col: start_col,
-									\ end_lnum: builder.lnum, end_col: builder.col})
-					else | throw 'Bad type' | endif
-				endfor
-			endfunction
-			call s:HandleContent(snippet.content)
-		endwhile
+		let [placeholders, mirrors] = [[], []]
+		function! s:HandleContent(content) abort closure
+			for item in a:content
+				if item.type ==# 'text'
+					call builder.append(item.content)
+					if item->get('is_eol', 0) | call builder.new_line() | endif
+				elseif item.type ==# 'placeholder'
+					let [start_lnum, start_col] = [builder.lnum, builder.col]
+					call s:HandleContent(item.initial)
+					if !empty(a:snippet.placeholder_dependants->get(item.number, []))
+						let cached_placeholders[item.number] = builder.get_text(start_lnum, start_col)
+									\ ->join("\n")
+					endif
+					eval placeholders->add(#{
+								\ lnum: start_lnum, col: start_col,
+								\ end_lnum: builder.lnum, end_col: builder.col,
+								\ number: item.number,
+								\ })
+				elseif item.type ==# 'mirror'
+					let mirror = a:snippet.mirrors[item.id]
+					if !(mirror.dependencies->s:All({v -> cached_placeholders->has_key(v)}))
+						let finished = 0
+					endif
+					let text = finished ? mirror->s:EvalMirror(instance) : ''
+					let [start_lnum, start_col] = [builder.lnum, builder.col]
+					call builder.append(text)
+					eval mirrors->add(#{lnum: start_lnum, col: start_col,
+								\ end_lnum: builder.lnum, end_col: builder.col})
+				else | throw 'Bad type' | endif
+			endfor
+		endfunction
+		call s:HandleContent(a:snippet.content)
+	endwhile
 
-		call s:Edit(lnum, col, lnum, col + 3, builder.text)
+	call s:Edit(lnum, col, lnum, col + length, builder.text)
 
-		let instance.first_placeholder_id = s:next_placeholder_id
-		let instance.first_mirror_id = instance.first_placeholder_id + placeholders->len()
-		let s:next_placeholder_id += placeholders->len() + mirrors->len()
+	let instance.first_placeholder_id = s:next_placeholder_id
+	let instance.first_mirror_id = instance.first_placeholder_id + placeholders->len()
+	let s:next_placeholder_id += placeholders->len() + mirrors->len()
 
-		let first_placeholder = placeholders->len() > 1 ? 1 : 0
-		for placeholder in placeholders
-			let placeholder_id = instance.first_placeholder_id + placeholder.number
-			call prop_add(placeholder.lnum, placeholder.col, #{
-						\ end_lnum: placeholder.end_lnum, end_col: placeholder.end_col,
-						\ type: 'placeholder', id: placeholder_id,
-						\ })
-			let s:placeholder2instance[placeholder_id] = instance
+	let first_placeholder = placeholders->len() > 1 ? 1 : 0
+	for placeholder in placeholders
+		let placeholder_id = instance.first_placeholder_id + placeholder.number
+		call prop_add(placeholder.lnum, placeholder.col, #{
+					\ end_lnum: placeholder.end_lnum, end_col: placeholder.end_col,
+					\ type: 'placeholder', id: placeholder_id,
+					\ })
+		let s:placeholder2instance[placeholder_id] = instance
 
-			if placeholder.number == first_placeholder
-				call s:SelectText(placeholder.lnum, placeholder.col,
-							\ placeholder.end_lnum, placeholder.end_col)
-			endif
-		endfor
+		if placeholder.number == first_placeholder
+			call s:SelectText(placeholder.lnum, placeholder.col,
+						\ placeholder.end_lnum, placeholder.end_col)
+		endif
+	endfor
 
-		for i in range(mirrors->len())
-			let mirror = mirrors[i]
-			call prop_add(mirror.lnum, mirror.col, #{
-						\ end_lnum: mirror.end_lnum, end_col: mirror.end_col,
-						\ type: 'mirror', id: instance.first_mirror_id + i,
-						\ })
-		endfor
+	for i in range(mirrors->len())
+		let mirror = mirrors[i]
+		call prop_add(mirror.lnum, mirror.col, #{
+					\ end_lnum: mirror.end_lnum, end_col: mirror.end_col,
+					\ type: 'mirror', id: instance.first_mirror_id + i,
+					\ })
+	endfor
 
-		eval b:snippet_stack->add(instance)
-		return 1
-	endif
-
-	return s:JumpForward()
+	eval b:snippet_stack->add(instance)
+	return 1
 endfunction
 
 function s:PopActiveSnippet() abort
@@ -245,9 +243,7 @@ function s:InstanceIdOfPlaceholder(id) abort
 endfunction
 
 function s:PopUntilBecomesCurrent(id)
-	while !(b:snippet_stack[-1]->s:HasPlaceholder(a:id))
-		call s:PopActiveSnippet()
-	endwhile
+	while !(b:snippet_stack[-1]->s:HasPlaceholder(a:id)) | call s:PopActiveSnippet() | endwhile
 endfunction
 
 " Return all placeholder properties that contain the cursor.
@@ -267,7 +263,7 @@ endfunction
 
 let s:NextPlaceholderId = {id, instance -> id >= instance.snippet.placeholders->len() - 1 ? 0 : id + 1}
 
-function s:JumpForward(...) abort
+function s:Jump(...) abort
 	let opts = a:000->get(0, {})
 	let dry_run = opts->get('dry_run', 0)
 
@@ -318,10 +314,10 @@ function s:ParseSnippets(text) abort
 
 			if !self.in_snippet
 				if line !~# '^\s*$\|^#' " Ignore empty lines and comment
-					let res = line->matchlist('^snippet')
+					let res = line->matchlist('^snippet\s\+\(.\)\(\%(\1\@!.\)*\)\@>\1\s\+"\([^"]*\)"')
 					if res->empty() | throw 'Bad line ' .. line | endif
-					let [match; rest] = res
-					eval self.queue->add(#{type: 'startsnippet'})
+					let [match, _, trigger, desc; rest] = res
+					eval self.queue->add(#{type: 'startsnippet', trigger: trigger, description: desc})
 					let self.in_snippet = 1
 				endif
 
@@ -331,7 +327,6 @@ function s:ParseSnippets(text) abort
 
 			" TODO Allow escape sequences
 			let [match, start, end] = line->matchstrpos('${\d\+:\?\|{\|}\|`[^`]\+`\|endsnippet\s*$\|$', self.col)
-
 			let before = line->strpart(self.col, start - self.col)
 			if !empty(before) | eval self.queue->add(#{type: 'text', content: before}) | endif
 
@@ -386,7 +381,11 @@ function s:ParseSnippets(text) abort
 			if item is 0 | let item = s:ParseBracketPair() | endif
 			if item is 0 | let item = s:ParseMirror() | endif
 			if item is 0 | break | endif
-			eval result->add(item)
+			if v:t_list == item->type()
+				eval result->extend(item)
+			else
+				eval result->add(item)
+			endif
 		endwhile
 		return result
 	endfunction
@@ -401,7 +400,7 @@ function s:ParseSnippets(text) abort
 		return result
 	endfunction
 
-	function! s:DetectCycles(nodes) abort
+	function! s:AssertNoCycle(nodes) abort
 		function! s:DetectCyclesGo(node) abort closure
 			if a:node.color == 1 | throw 'Detected cycle!' | endif
 			let a:node.color = 1
@@ -419,8 +418,8 @@ function s:ParseSnippets(text) abort
 
 	let snippets = []
 	while 1
-		let token = lexer.accept('startsnippet')
-		if token is 0 | break | endif
+		let startsnippet_token = lexer.accept('startsnippet')
+		if startsnippet_token is 0 | break | endif
 
 		let placeholders = {}
 		let placeholder_dependants = {}
@@ -485,22 +484,16 @@ function s:ParseSnippets(text) abort
 			let placeholder_nodes[0] = #{color: 0, children: []}
 		endif
 
-		call s:DetectCycles(placeholder_nodes)
+		call s:AssertNoCycle(placeholder_nodes)
 
 		call lexer.expect('endsnippet')
 		eval snippets->add(#{content: content, placeholders: placeholders, mirrors: mirrors,
 					\ placeholder_dependants: placeholder_dependants,
+					\ trigger: startsnippet_token.trigger, description: startsnippet_token.description,
 					\ })
 	endwhile
 	return snippets
 endfunction
-
-inoremap <script> <Plug>SnipExpandOrJump <Esc>:call <SID>ExpandOrJump()<CR>
-
-" Can use <C-R>= in insmode to not move cursor?
-imap <unique> <expr> <Tab> <SID>ShouldTrigger() ? "\<Plug>SnipExpandOrJump"
-			\ : "\<Tab>"
-" TODO Jump in select mode snoremap <unique> <Tab>
 
 let s:listener_disabled = 0
 function s:Listener(bufnr, start, end, added, changes) abort
@@ -545,8 +538,9 @@ endfunction
 
 function s:EvalMirror(mirror, instance) abort
 	for dependency in a:mirror.dependencies
-		let g:placeholder_values[dependency] = a:instance.cached_placeholders[dependency]
+		let g:placeholder_values[dependency] = a:instance.cached_placeholders->get(dependency, '')
 	endfor
+	let g:m = a:instance.match
 	return eval(a:mirror.value)
 endfunction
 
@@ -573,23 +567,20 @@ function s:UpdateMirrors(timer) abort
 	endtry
 endfunction
 
-let s:SnippetFiletypes = {-> split(&filetype, '\.') + ['all']}
-
 function s:OnBufEnter() abort
 	if exists('b:snippet_stack') | return | endif
 	let b:snippet_stack = []
-
 	call listener_add(funcref('s:Listener'))
 endfunction
+
+let s:SnippetFiletypes = {-> split(&filetype, '\.') + ['all']}
+let s:SourcesForFiletype = {ft -> printf('SnippSnapp/**/%s.snippets', ft)->globpath(&runtimepath, 1, 1)}
 
 function s:SourceSnippetFile() abort
 	let file = expand('<afile>:p')
 	let ft = file->fnamemodify(':t:r')
-	let snippets = readfile(file)->s:ParseSnippets()
-	let s:snippets_by_ft[ft] = snippets
+	let s:snippets_by_ft[ft] = readfile(file)->s:ParseSnippets()
 endfunction
-
-let s:SourcesForFiletype = {ft -> printf('SnippSnapp/**/%s.snippets', ft)->globpath(&runtimepath, 1, 1)}
 
 function s:EnsureSnippetsLoaded(filetype) abort
 	" TODO Handle multiple files for single filetype
@@ -613,6 +604,11 @@ augroup snippet
 	autocmd SourceCmd *.snippets call s:SourceSnippetFile()
 	autocmd FileType * call s:EnsureSnippetsLoaded('<amatch>')
 augroup END
+
+inoremap <script> <unique> <Plug>SnipExpandOrJump <C-R>=<SID>ExpandOrJump()<CR>
+
+inoremap <silent> <unique> <Tab> <C-R>=<SID>ExpandOrJump() ? '' : "\<Tab>"<CR>
+snoremap <unique> <Tab> <Esc>:call <SID>Jump()<CR>
 
 call s:EnsureSnippetsLoaded('all')
 
