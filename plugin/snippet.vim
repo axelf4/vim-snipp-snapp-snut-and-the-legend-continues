@@ -26,7 +26,7 @@ function s:Edit(lnum, col, end_lnum, end_col, text) abort
 	endif
 	let [bufnum, lnum, col, _, curswant] = getcurpos()
 	execute printf('keeppatterns %dsubstitute/\%%%dc\_.*\%%%dl\%%%dc/%s',
-				\ a:lnum, a:col, a:end_lnum, a:end_col, a:text->join("\<CR>")->escape('\'))
+				\ a:lnum, a:col, a:end_lnum, a:end_col, a:text->join("\<CR>")->escape('/\'))
 
 	" Update cursor position
 	if (a:lnum < lnum || a:lnum == lnum && a:col <= col)
@@ -52,7 +52,7 @@ function s:Select(lnum, col, end_lnum, end_col) abort
 	call feedkeys((mode() !=# 'n' ? "\<Esc>" : '')
 				\ .. ':set virtualedit=onemore | call cursor(' .. a:lnum .. ',' .. a:col .. ")\<CR>"
 				\ .. (zero_len ? "i\<C-O>:set virtualedit=" .. save_virtualedit .. "\<CR>"
-				\ : "v:\<C-U>call cursor(" .. a:end_lnum .. ',' .. a:end_col .. ")\<CR>\<C-H>:set virtualedit=" .. save_virtualedit .. "\<CR>v`<o\<C-G>"),
+				\ : "v:\<C-U>call cursor(" .. a:end_lnum .. ',' .. a:end_col .. ")\<CR>\<C-H>:set virtualedit=" .. save_virtualedit .. "\<CR>v`<\<C-G>"),
 				\ 'n')
 endfunction
 
