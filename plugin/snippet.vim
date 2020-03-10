@@ -52,7 +52,7 @@ endfunction
 " Start Select mode with the specified area.
 "
 " The implementation is terrible to support CTRL-R =.
-function s:SelectText(lnum, col, end_lnum, end_col) abort
+function s:Select(lnum, col, end_lnum, end_col) abort
 	" TODO Handle all cases of &selection
 	let save_virtualedit = &virtualedit
 	let zero_len = a:lnum == a:end_lnum && a:col == a:end_col
@@ -65,7 +65,7 @@ endfunction
 
 function s:SelectProp(prop) abort
 	" TODO Add support for multiline props
-	call s:SelectText(a:prop.lnum, a:prop.col, a:prop.lnum, a:prop.col + a:prop.length)
+	call s:Select(a:prop.lnum, a:prop.col, a:prop.lnum, a:prop.col + a:prop.length)
 endfunction
 
 " Returns the text content of the textprop {prop}.
@@ -96,8 +96,8 @@ endfunction
 function s:PossibleSnippets() abort
 	let snippets = []
 	let [line, col] = [getline('.'), col('.')]
-	for snippet in s:SnippetFiletypes()->s:FlatMap({ft -> s:snippets_by_ft[ft]})
-		let match = line->matchlist(snippet.trigger .. '\%' .. (col) .. 'c')
+	for snippet in s:SnippetFiletypes()->s:FlatMap({ft -> s:snippets_by_ft->get(ft, [])})
+		let match = line->matchlist(printf('\%(%s\)\%%%dc', snippet.trigger, col))
 		if !empty(match)
 			eval snippets->add([snippet, match])
 		endif
@@ -196,7 +196,7 @@ function s:Expand(snippet, match) abort
 		let s:placeholder2instance[placeholder_id] = instance
 
 		if placeholder.number == first_placeholder
-			call s:SelectText(placeholder.lnum, placeholder.col,
+			call s:Select(placeholder.lnum, placeholder.col,
 						\ placeholder.end_lnum, placeholder.end_col)
 		endif
 	endfor
@@ -314,7 +314,7 @@ function s:ParseSnippets(text) abort
 
 			if !self.in_snippet
 				if line !~# '^\s*$\|^#' " Ignore empty lines and comment
-					let res = line->matchlist('^snippet\s\+\(.\)\(\%(\1\@!.\)*\)\@>\1\s\+"\([^"]*\)"')
+					let res = line->matchlist('^snippet\s\+\(.\)\(\%(\1\@!.\)*\)\@>\1\%(\s\+"\([^"]*\)"\)\?')
 					if res->empty() | throw 'Bad line ' .. line | endif
 					let [match, _, trigger, desc; rest] = res
 					eval self.queue->add(#{type: 'startsnippet', trigger: trigger, description: desc})
@@ -500,12 +500,12 @@ function s:Listener(bufnr, start, end, added, changes) abort
 	" Quit early if there are no active snippets
 	if b:snippet_stack->empty() | return | endif
 
+	let max_instance_nr = -1 " Largest snippet instance index seen
 	" Clear snippet stack if edited line not containing a placeholder
 	for change in a:changes
 		" Skip deletions since no efficient way to know if snippet was deleted
 		if change.added < 0 | continue | endif
 
-		let max_instance_nr = -1 " Largest snippet instance index seen
 		for lnum in range(change.lnum, change.end + change.added - 1)
 			for prop in prop_list(lnum)
 				if prop.type !=# 'placeholder' || prop.col + prop.length < change.col | continue | endif
@@ -526,12 +526,12 @@ function s:Listener(bufnr, start, end, added, changes) abort
 				endif
 			endfor
 		endfor
-
-		if !s:listener_disabled
-			" If the change was not to active placeholder: Quit current snippet
-			for _ in range(b:snippet_stack->len() - max_instance_nr - 1) | call s:PopActiveSnippet() | endfor
-		endif
 	endfor
+
+	if !s:listener_disabled
+		" If the change was not to active placeholder: Quit current snippet
+		for _ in range(b:snippet_stack->len() - max_instance_nr - 1) | call s:PopActiveSnippet() | endfor
+	endif
 
 	call timer_start(0, funcref('s:UpdateMirrors'))
 endfunction
@@ -594,6 +594,10 @@ function s:SnippetEdit(mods) abort
 	let file = s:SnippetFiletypes()->s:FlatMap({ft -> s:SourcesForFiletype(ft)})->get(0,
 				\ printf('%s/%s.snippets', &runtimepath->split(',')[0], s:SnippetFiletypes()[0]))
 	execute a:mods 'split' file
+	augroup snippet_def_buffer
+		autocmd!
+		autocmd BufWritePost <buffer> ++nested source <afile>
+	augroup END
 endfunction
 
 command -bar SnippetEdit call s:SnippetEdit(<q-mods>)
