@@ -1,0 +1,87 @@
+*SnippSnapp.txt*	Plugin for snippets
+
+==============================================================================
+1. Introduction					*SnippSnapp-introduction*
+
+SnippSnapp is a snippet manager for Vim. Snippets are templates that can be
+inserted to ease writing repetitious text.
+
+This plugin requires Vim version 8.2 or later and the |+textprop| feature
+along with a set of complementary patches.
+
+==============================================================================
+2. Authoring snippets			*SnippSnapp-authoring-snippets*
+
+Each entry in 'runtimepath' is looked inside for a SnippSnapp directory
+containing snippet definition files. If "ft" is the 'filetype' of the current
+buffer, then snippets in files matching "ft.snippets" will be available. The
+"all" filetype is special; those snippets will apply to every buffer.
+
+In a snippets file, empty lines or those starting with a # character are
+ignored.
+
+Each snippet definition take the following form: >
+
+    snippet /trigger/ [ "Description" ]
+    expanded text
+    more expanded text
+    endsnippet
+
+<
+While the trigger is required, the description is optional. The "/" trigger
+delimiters are not part of the trigger, and must not appear in it, though they
+can be any arbitrary non-whitespace character, that is, one could use quotes
+instead. The last newline character before the isolated "endsnippet" line is
+not considered part of the snippet.
+
+Balanced brace pairs do not have to be escaped.
+
+The body of a snippet can use some special constructs to control snippet
+expansion:
+
+
+PLACEHOLDERS					*SnippSnapp-placeholder*
+
+The syntax for a placeholder is "${number [ : default content ]}", for example
+"${1:foo}". The placeholder text will be selected such that it can be easily
+modified. They will be visited in increasing order, ending with "${0}". If
+there is no "${0}" defined, it will implicitly be appended at the end of the
+snippet. Note: Placeholder numbers must be unique. (To have subsequent usages
+mirror the first one: Use mirrors instead!)
+
+Placeholders can be nested, like "${1:another ${2:placeholder}}", but there
+are some caveats.
+
+
+MIRRORS				*SnippSnapp-interpolation* *SnippSnapp-mirror*
+
+Mirrors can be used for two purposes: (1) To reflect the content of a
+placeholder; or (2) To embed the result of evaluating a Vim script expression;
+or both. Their syntax is "`{Vim script expression}`". Inside the expression
+any "${number}" will be replaced with an expression evaluating to the content
+of the corresponding placeholder.
+
+This is useful for things such as TeX environments. Here is an example
+snippet: >
+
+    snippet "env"
+    \begin{${1:center}}
+        ${0}
+    \begin{`$1`}
+    endsnippet
+
+<
+The graph induced by the DEPENDS ON equivalence relation on the set of
+placeholders and mirrors must be acyclic. This is statically checked.
+
+During evaluation of the mirror the internal variable "g:m" contains the
+trigger match, in a format alike what |matchlist()| returns.
+
+						*SnippSnapp-transformation*
+Transformations, present in e.g. TextMate, do not have their own special
+syntax. Instead mirrors can serve the purpose, using |substitute()|. For
+example: >
+    `${placeholder_no}->substitute({pattern}, {replacement}, {options})`
+
+
+ vim:tw=78:ts=8:noet:ft=help:norl:

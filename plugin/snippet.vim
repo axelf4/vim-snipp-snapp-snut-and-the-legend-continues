@@ -3,10 +3,8 @@ if !(has('textprop') && has("patch-8.2.324") && has("patch-8.2.357"))
 	throw 'Incompatible Vim version!'
 endif
 
-highlight Placeholder ctermbg=darkblue
-call prop_type_add('placeholder', #{highlight: 'Placeholder', start_incl: 1, end_incl: 1})
-highlight Mirror ctermbg=darkgreen
-call prop_type_add('mirror', #{highlight: 'Mirror', start_incl: 1, end_incl: 1})
+call prop_type_add('placeholder', #{start_incl: 1, end_incl: 1})
+call prop_type_add('mirror', #{start_incl: 1, end_incl: 1})
 
 let s:next_placeholder_id = 0
 " Map from placeholder ID:s to their respective snippet instances.
