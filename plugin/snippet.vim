@@ -25,15 +25,8 @@ function s:Edit(lnum, col, end_lnum, end_col, text) abort
 		throw 'Start is past end?'
 	endif
 	let [bufnum, lnum, col, _, curswant] = getcurpos()
-	" Replace with first and last line
-	" TODO Escape correctly (Consider using '\='?)
-	execute 'keeppatterns' a:lnum .. 'substitute/' .. ('\%' .. a:col .. 'c') .. '\_.*'
-				\ .. ('\%' .. a:end_lnum .. 'l') .. ('\%' .. a:end_col .. 'c')
-				\ .. '/' .. (a:text->empty() ? '' : a:text[0]
-				\ .. (a:text->len() > 1 ? '\r' .. a:text[-1] : '')) .. '/'
-	" Set middle section
-	call append(a:lnum, repeat([''], a:text->len() - 2))
-	eval a:text[1:-2]->setline(a:lnum + 1)
+	execute printf('keeppatterns %dsubstitute/\%%%dc\_.*\%%%dl\%%%dc/%s',
+				\ a:lnum, a:col, a:end_lnum, a:end_col, a:text->join("\<CR>")->escape('\'))
 
 	" Update cursor position
 	if (a:lnum < lnum || a:lnum == lnum && a:col <= col)
