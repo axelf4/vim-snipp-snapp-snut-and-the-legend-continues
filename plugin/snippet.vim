@@ -6,9 +6,7 @@ endif
 call prop_type_add('placeholder', #{start_incl: 1, end_incl: 1})
 call prop_type_add('mirror', #{start_incl: 1, end_incl: 1})
 
-let s:next_placeholder_id = 0
-" Map from placeholder ID:s to their respective snippet instances.
-let s:placeholder2instance = {}
+let s:next_prop_id = 0
 let g:placeholder_values = {} " TODO Temporarily used for mirror evaluation
 let s:snippets_by_ft = {}
 
@@ -163,8 +161,10 @@ function s:Expand(snippet, match) abort
 					let text = finished ? mirror->s:EvalMirror(instance) : ''
 					let [start_lnum, start_col] = [builder.lnum, builder.col]
 					call builder.append(text)
-					eval mirrors->add(#{lnum: start_lnum, col: start_col,
-								\ end_lnum: builder.lnum, end_col: builder.col})
+					if !empty(mirror.dependencies)
+						eval mirrors->add(#{id: item.id, lnum: start_lnum, col: start_col,
+									\ end_lnum: builder.lnum, end_col: builder.col})
+					endif
 				else | throw 'Bad type' | endif
 			endfor
 		endfunction
@@ -173,9 +173,9 @@ function s:Expand(snippet, match) abort
 
 	call s:Edit(lnum, col, lnum, col + length, builder.text)
 
-	let instance.first_placeholder_id = s:next_placeholder_id
+	let instance.first_placeholder_id = s:next_prop_id
 	let instance.first_mirror_id = instance.first_placeholder_id + placeholders->len()
-	let s:next_placeholder_id += placeholders->len() + mirrors->len()
+	let s:next_prop_id += placeholders->len() + a:snippet.mirrors->len()
 
 	let first_placeholder = placeholders->len() > 1 ? 1 : 0
 	for placeholder in placeholders
@@ -184,19 +184,16 @@ function s:Expand(snippet, match) abort
 					\ end_lnum: placeholder.end_lnum, end_col: placeholder.end_col,
 					\ type: 'placeholder', id: placeholder_id,
 					\ })
-		let s:placeholder2instance[placeholder_id] = instance
-
 		if placeholder.number == first_placeholder
 			call s:Select(placeholder.lnum, placeholder.col,
 						\ placeholder.end_lnum, placeholder.end_col)
 		endif
 	endfor
 
-	for i in range(mirrors->len())
-		let mirror = mirrors[i]
+	for mirror in mirrors
 		call prop_add(mirror.lnum, mirror.col, #{
 					\ end_lnum: mirror.end_lnum, end_col: mirror.end_col,
-					\ type: 'mirror', id: instance.first_mirror_id + i,
+					\ type: 'mirror', id: instance.first_mirror_id + mirror.id,
 					\ })
 	endfor
 
@@ -211,7 +208,6 @@ function s:PopActiveSnippet() abort
 	for placeholder_id in range(instance.first_placeholder_id,
 				\ instance.first_placeholder_id + instance.snippet.placeholders->len() - 1)
 		call prop_remove(#{id: placeholder_id, type: 'placeholder', both: 1, all: 1})
-		eval s:placeholder2instance->remove(placeholder_id)
 	endfor
 	for mirror_id in range(instance.first_mirror_id,
 				\ instance.first_mirror_id + instance.snippet.mirrors->len() - 1)
@@ -225,7 +221,7 @@ function s:HasPlaceholder(instance, id) abort
 				\ && a:instance.first_placeholder_id + a:instance.snippet.placeholders->len() - 1 >= a:id
 endfunction
 
-" Returns index of the snippet instance containing the placeholder with {id}.
+" Return the index of the snippet instance containing the placeholder with {id}.
 function s:InstanceIdOfPlaceholder(id) abort
 	for i in range(b:snippet_stack->len() - 1, 0, -1)
 		if b:snippet_stack[i]->s:HasPlaceholder(a:id) | return i | endif
@@ -488,8 +484,7 @@ endfunction
 
 let s:listener_disabled = 0
 function s:Listener(bufnr, start, end, added, changes) abort
-	" Quit early if there are no active snippets
-	if b:snippet_stack->empty() | return | endif
+	if b:snippet_stack->empty() | return | endif " Quit early if there are no active snippets
 
 	let max_instance_nr = -1 " Largest snippet instance index seen
 	" Clear snippet stack if edited line not containing a placeholder
@@ -500,6 +495,7 @@ function s:Listener(bufnr, start, end, added, changes) abort
 		for lnum in range(change.lnum, change.end + change.added - 1)
 			for prop in prop_list(lnum)
 				if prop.type !=# 'placeholder' || prop.col + prop.length < change.col | continue | endif
+				" TODO Undo can cause this to fail
 				let instance_id = prop.id->s:InstanceIdOfPlaceholder()
 				if instance_id > max_instance_nr | let max_instance_nr = instance_id | endif
 				let instance = b:snippet_stack[instance_id]

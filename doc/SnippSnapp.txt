@@ -20,7 +20,7 @@ buffer, then snippets in files matching "ft.snippets" will be available. The
 In a snippets file, empty lines or those starting with a # character are
 ignored.
 
-Each snippet definition take the following form: >
+Each snippet definition takes the following form: >
 
     snippet /trigger/ [ "Description" ]
     expanded text
