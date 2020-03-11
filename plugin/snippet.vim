@@ -1,5 +1,6 @@
 " Vim plugin for snippets
-if !(has('textprop') && has("patch-8.2.324") && has("patch-8.2.357"))
+if !(has('textprop') && has("patch-8.2.324") && has("patch-8.2.357")
+			\ && has("patch-8.2.372"))
 	throw 'Incompatible Vim version!'
 endif
 
