@@ -53,6 +53,18 @@ function s:Select(lnum, col, end_lnum, end_col) abort
 				\ 'n')
 endfunction
 
+" Search for property with {id} starting after/before {ref} on {lnum}.
+"
+" If {direction} > 0: Search forward; if < 0: Backward.
+function s:PropFindRelative(ref, id, lnum, direction) abort
+	" FIXME Cannot provide a type='placeholder/mirror' here because it is an OR...
+	" Careful: ref might span many lines with match above lnum
+	let start = a:direction < 0 || a:ref.start ? a:ref
+				\ : prop_find(#{id: a:ref.id, lnum: a:lnum, col: a:ref.col}, 'b')
+	return prop_find(#{id: a:id, lnum: start->get('lnum', a:lnum), col: start.col},
+				\ a:direction < 0 ? 'b' : 'f')
+endfunction
+
 function s:SelectProp(prop) abort
 	" TODO Add support for multiline props
 	call s:Select(a:prop.lnum, a:prop.col, a:prop.lnum, a:prop.col + a:prop.length)
@@ -178,34 +190,38 @@ function s:Expand(snippet, match) abort
 	let instance.first_mirror_id = instance.first_placeholder_id + placeholders->len()
 	let s:next_prop_id += placeholders->len() + a:snippet.mirrors->len()
 
-	let first_placeholder = placeholders->len() > 1 ? 1 : 0
-	for placeholder in placeholders
-		let placeholder_id = instance.first_placeholder_id + placeholder.number
-		call prop_add(placeholder.lnum, placeholder.col, #{
-					\ end_lnum: placeholder.end_lnum, end_col: placeholder.end_col,
-					\ type: 'placeholder', id: placeholder_id,
-					\ })
-		if placeholder.number == first_placeholder
-			call s:Select(placeholder.lnum, placeholder.col,
-						\ placeholder.end_lnum, placeholder.end_col)
-		endif
-	endfor
+	if placeholders->len() == 1 " Jump to last placeholder
+		let prop_zero = placeholders[0]
+		call s:Select(prop_zero.lnum, prop_zero.col, prop_zero.end_lnum, prop_zero.end_col)
+	else
+		let first_placeholder = placeholders->len() > 1 ? 1 : 0
+		for placeholder in placeholders
+			let placeholder_id = instance.first_placeholder_id + placeholder.number
+			call prop_add(placeholder.lnum, placeholder.col, #{
+						\ end_lnum: placeholder.end_lnum, end_col: placeholder.end_col,
+						\ type: 'placeholder', id: placeholder_id,
+						\ })
+			if placeholder.number == first_placeholder
+				call s:Select(placeholder.lnum, placeholder.col,
+							\ placeholder.end_lnum, placeholder.end_col)
+			endif
+		endfor
 
-	for mirror in mirrors
-		call prop_add(mirror.lnum, mirror.col, #{
-					\ end_lnum: mirror.end_lnum, end_col: mirror.end_col,
-					\ type: 'mirror', id: instance.first_mirror_id + mirror.id,
-					\ })
-	endfor
+		for mirror in mirrors
+			call prop_add(mirror.lnum, mirror.col, #{
+						\ end_lnum: mirror.end_lnum, end_col: mirror.end_col,
+						\ type: 'mirror', id: instance.first_mirror_id + mirror.id,
+						\ })
+		endfor
 
-	eval b:snippet_stack->add(instance)
+		eval b:snippet_stack->add(instance)
+	endif
 	return 1
 endfunction
 
 function s:PopActiveSnippet() abort
 	if b:snippet_stack->empty() | throw 'Popping empty stack?' | endif
 	let instance = b:snippet_stack->remove(-1)
-
 	for placeholder_id in range(instance.first_placeholder_id,
 				\ instance.first_placeholder_id + instance.snippet.placeholders->len() - 1)
 		call prop_remove(#{id: placeholder_id, type: 'placeholder', both: 1, all: 1})
@@ -219,73 +235,53 @@ endfunction
 " Return whether placeholder {id} belongs to snippet {instance}.
 function s:HasPlaceholder(instance, id) abort
 	return a:instance.first_placeholder_id <= a:id
-				\ && a:instance.first_placeholder_id + a:instance.snippet.placeholders->len() - 1 >= a:id
+				\ && a:id < a:instance.first_placeholder_id + a:instance.snippet.placeholders->len()
 endfunction
 
-" Return the index of the snippet instance containing the placeholder with {id}.
+" Return the index of the snippet instance containing the placeholder with {id} or -1.
 function s:InstanceIdOfPlaceholder(id) abort
 	for i in range(b:snippet_stack->len() - 1, 0, -1)
 		if b:snippet_stack[i]->s:HasPlaceholder(a:id) | return i | endif
 	endfor
-	throw 'Invalid placeholder id: ' .. a:id
-endfunction
-
-function s:PopUntilBecomesCurrent(id)
-	while !(b:snippet_stack[-1]->s:HasPlaceholder(a:id)) | call s:PopActiveSnippet() | endwhile
-endfunction
-
-" Return all placeholder properties that contain the cursor.
-function s:CurrentPlaceholder(lnum, ...) abort
-	let col = a:000->get(0, -1) " Second argument is optionally a column
-	let props = prop_list(a:lnum)->filter({_, v -> v.type ==# 'placeholder'})
-
-	if col != -1
-		eval props->filter({_, v -> v.col <= col && v.col + v.length >= col})
-	endif
-
-	" Sort after specificity
-	eval props->sort({a, b -> b.id - a.id})
-
-	return props
+	return -1
 endfunction
 
 let s:NextPlaceholderId = {id, instance -> id >= instance.snippet.placeholders->len() - 1 ? 0 : id + 1}
 
-function s:Jump(...) abort
-	let opts = a:000->get(0, {})
-	let dry_run = opts->get('dry_run', 0)
-
-	let current_props = s:CurrentPlaceholder(line('.'), col('.'))
+function s:Jump() abort
+	let [lnum, col] = [line('.'), col('.')]
+	" Get all placeholders that contain cursor sorted after specificity
+	let current_props = prop_list(lnum)->filter({_, v -> v.type ==# 'placeholder'
+				\ && v.col <= col && col <= v.col + v.length})
+				\ ->sort({a, b -> b.id - a.id})
 	for placeholder_prop in current_props
-		call s:PopUntilBecomesCurrent(placeholder_prop.id)
-		let current_instance = b:snippet_stack[-1]
-		let number = placeholder_prop.id - current_instance.first_placeholder_id
-
 		while 1
-			let number = s:NextPlaceholderId(number, current_instance)
-			" Search forward/backward from cursor for tab stop
-			" TODO optimze direction
-			for direction in ['f', 'b']
-				" FIXME Cannot provide a type='placeholder' here because it is an OR...
-				let prop = prop_find(#{
-							\ id: current_instance.first_placeholder_id + number,
-							\ skipstart: 0,
-							\ }, direction)
-				if !empty(prop)
-					" Found property to jump to!
-					if dry_run | return 1 | endif
+			if b:snippet_stack->empty() " Undo etc can cause stray placeholder props
+				call prop_remove(#{type: 'placeholder', all: 1})
+				return
+			endif
+			if b:snippet_stack[-1]->s:HasPlaceholder(placeholder_prop.id) | break | endif
+			call s:PopActiveSnippet()
+		endwhile
+		let instance = b:snippet_stack[-1]
+		let number = placeholder_prop.id - instance.first_placeholder_id
 
-					" If jumping to last placeholder: Snippet is done!
-					if number == 0 | call s:PopActiveSnippet() | endif
+		while number > 0
+			let next = s:NextPlaceholderId(number, instance)
+			let direction = instance.snippet.placeholders[next].order
+						\ - instance.snippet.placeholders[number].order
+			let prop = placeholder_prop->s:PropFindRelative(instance.first_placeholder_id + next,
+						\ lnum, direction)
+			" If jumping to last placeholder: Snippet is done!
+			if next == 0 | call s:PopActiveSnippet() | endif
 
-					call s:SelectProp(prop) " Leave user editing the next tab stop
-					return 1
-				endif
-			endfor
+			if !empty(prop) " Found property to jump to!
+				call s:SelectProp(prop) " Leave user editing the next tab stop
+				return 1
+			endif
+			let number = next
 		endwhile
 	endfor
-
-	return 0
 endfunction
 
 " Parse snippet definitions from the List {text} of lines.
@@ -412,7 +408,6 @@ function s:ParseSnippets(text) abort
 		let placeholders = {}
 		let placeholder_dependants = {}
 		let mirrors = []
-
 		let placeholder_nodes = {} " Nodes in graph induced by DEPENDS ON relation
 		let current_placeholder_node = v:null
 
@@ -427,9 +422,9 @@ function s:ParseSnippets(text) abort
 			let [prev_placeholder_node, current_placeholder_node] = [current_placeholder_node, #{color: 0, children: []}]
 			let placeholder_nodes[token.number] = current_placeholder_node
 
+			let placeholders[token.number] = #{order: placeholders->len() + mirrors->len()}
 			let placeholder = #{type: 'placeholder', number: token.number,
 						\ initial: token.has_inital ? s:ParseContent() : [],}
-			let placeholders[placeholder.number] = #{order: placeholders->len()}
 			call lexer.expect('}')
 
 			let current_placeholder_node = prev_placeholder_node
@@ -458,7 +453,8 @@ function s:ParseSnippets(text) abort
 				return 'g:placeholder_values[' .. placeholder_number .. ']'
 			endfunction
 			let value = token.value->substitute('$\(\d\+\)', funcref('s:MirrorReplace'), 'g')
-			eval mirrors->add(#{value: value, dependencies: dependencies})
+			eval mirrors->add(#{value: value, dependencies: dependencies,
+						\ order: placeholders->len() + mirrors->len()})
 			return #{type: 'mirror', id: mirror_id, value: value}
 		endfunction
 
@@ -488,7 +484,6 @@ function s:Listener(bufnr, start, end, added, changes) abort
 	if b:snippet_stack->empty() | return | endif " Quit early if there are no active snippets
 
 	let max_instance_nr = -1 " Largest snippet instance index seen
-	" Clear snippet stack if edited line not containing a placeholder
 	for change in a:changes
 		" Skip deletions since no efficient way to know if snippet was deleted
 		if change.added < 0 | continue | endif
@@ -496,8 +491,12 @@ function s:Listener(bufnr, start, end, added, changes) abort
 		for lnum in range(change.lnum, change.end + change.added - 1)
 			for prop in prop_list(lnum)
 				if prop.type !=# 'placeholder' || prop.col + prop.length < change.col | continue | endif
-				" TODO Undo can cause this to fail
 				let instance_id = prop.id->s:InstanceIdOfPlaceholder()
+				if instance_id == -1
+					" Undo can re-add old props, if so: Remove them
+					call prop_remove(#{id: prop.id, type: 'placeholder', both: 1}, lnum)
+					continue
+				endif
 				if instance_id > max_instance_nr | let max_instance_nr = instance_id | endif
 				let instance = b:snippet_stack[instance_id]
 
@@ -506,10 +505,10 @@ function s:Listener(bufnr, start, end, added, changes) abort
 				if !empty(dependants)
 					let new_content = prop->s:PropContent(lnum)
 					if new_content ==# instance.cached_placeholders[placeholder_number] | continue | endif
+					" Store its content and add dependants to list with ref
 					let instance.cached_placeholders[placeholder_number] = new_content
-					" Store its content and add dependants to list
 					for dependant in dependants
-						let instance.dirty_mirrors[dependant] = 1
+						let instance.dirty_mirrors[dependant] = #{prop: prop, lnum: lnum}
 					endfor
 				endif
 			endfor
@@ -534,14 +533,15 @@ endfunction
 
 function s:UpdateMirrors(timer) abort
 	for instance in b:snippet_stack
-		for dirty in instance.dirty_mirrors->keys()
+		for [dirty, ref] in instance.dirty_mirrors->items()
 			let mirror = instance.snippet.mirrors[dirty]
-			let mirror_prop = prop_find(#{
-						\ id: instance.first_mirror_id + dirty,
-						\ lnum: 1,
-						\ })
-			let text = mirror->s:EvalMirror(instance)
+			let placeholder = instance.snippet.placeholders[ref.prop.id - instance.first_placeholder_id]
+			let direction = mirror.order - placeholder.order
+			let mirror_prop = ref.prop->s:PropFindRelative(instance.first_mirror_id + dirty,
+						\ ref.lnum, direction)
+			if mirror_prop->empty() | continue | endif " Might have been deleted
 
+			let text = mirror->s:EvalMirror(instance)
 			call s:Edit(mirror_prop.lnum, mirror_prop.col, mirror_prop.lnum,
 						\ mirror_prop.col + mirror_prop.length, [text])
 		endfor
