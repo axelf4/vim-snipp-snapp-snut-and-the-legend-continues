@@ -4,6 +4,9 @@ if !(has('textprop') && has("patch-8.2.324") && has("patch-8.2.357")
 	throw 'Incompatible Vim version!'
 endif
 
+if exists('g:loaded_snipp_snapp_snut') | finish | endif
+let g:loaded_snipp_snapp_snut = 1
+
 call prop_type_add('placeholder', #{start_incl: 1, end_incl: 1})
 call prop_type_add('mirror', #{start_incl: 1, end_incl: 1})
 
