@@ -102,7 +102,7 @@ function s:PossibleSnippets() abort
 	let snippets = []
 	let [line, col] = [getline('.'), col('.')]
 	for snippet in s:SnippetFiletypes()->s:FlatMap({ft -> s:snippets_by_ft->get(ft, [])})
-		let match = line->matchlist(printf('\%(%s\)\%%%dc', snippet.trigger, col))
+		let match = line->matchlist(printf('\%%(%s\)\%%%dc', snippet.trigger, col))
 		if !empty(match)
 			eval snippets->add([snippet, match])
 		endif
@@ -531,6 +531,7 @@ function s:EvalMirror(mirror, instance) abort
 		let g:placeholder_values[dependency] = a:instance.cached_placeholders->get(dependency, '')
 	endfor
 	let g:m = a:instance.match
+	echom g:m
 	return eval(a:mirror.value)
 endfunction
 
