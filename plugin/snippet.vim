@@ -249,11 +249,17 @@ function s:InstanceIdOfPlaceholder(id) abort
 	return -1
 endfunction
 
-let s:NextPlaceholderId = {id, instance -> id >= instance.snippet.placeholders->len() - 1 ? 0 : id + 1}
+let s:NextPlaceholderId = {id, instance, direction -> direction ==# 'f'
+			\ ? (id >= instance.snippet.placeholders->len() - 1 ? 0 : id + 1) : id - 1}
 
-function s:Jump() abort
+" Jump to the next/previous placeholder relative to the one at the cursor.
+"
+" Optional argument [direction] can be "f" for forward, or "b" for backward.
+" Returns whether successful.
+function s:Jump(...) abort
+	let direction = a:000->get(0, 'f')
 	let [lnum, col] = [line('.'), col('.')]
-	" Get all placeholders that contain cursor sorted after specificity
+	" Get all placeholders containing the cursor sorted after specificity
 	let current_props = prop_list(lnum)->filter({_, v -> v.type ==# 'placeholder'
 				\ && v.col <= col && col <= v.col + v.length})
 				\ ->sort({a, b -> b.id - a.id})
@@ -269,8 +275,8 @@ function s:Jump() abort
 		let instance = b:snippet_stack[-1]
 		let number = placeholder_prop.id - instance.first_placeholder_id
 
-		while number > 0
-			let next = s:NextPlaceholderId(number, instance)
+		while number > (direction ==# 'f' ? 0 : 1)
+			let next = s:NextPlaceholderId(number, instance, direction)
 			let direction = instance.snippet.placeholders[next].order
 						\ - instance.snippet.placeholders[number].order
 			let prop = placeholder_prop->s:PropFindRelative(instance.first_placeholder_id + next,
@@ -605,6 +611,8 @@ inoremap <script> <unique> <Plug>SnipExpandOrJump <C-R>=<SID>ExpandOrJump()<CR>
 
 inoremap <silent> <unique> <Tab> <C-R>=<SID>ExpandOrJump() ? '' : "\<Tab>"<CR>
 snoremap <unique> <Tab> <Esc>:call <SID>Jump()<CR>
+inoremap <unique> <S-Tab> <C-R>=<SID>Jump('b') ? '' : "\<S-Tab>"<CR>
+snoremap <unique> <S-Tab> <Esc>:call <SID>Jump('b')<CR>
 
 call s:EnsureSnippetsLoaded('all')
 
