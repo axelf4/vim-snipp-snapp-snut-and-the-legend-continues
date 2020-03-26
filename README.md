@@ -1,4 +1,5 @@
 # vim-snipp-snapp-snut-and-the-legend-continues
+![](https://github.com/axelf4/vim-snipp-snapp-snut-and-the-legend-continues/workflows/CI/badge.svg)
 
 Experimental Vim plugin utilizing text properties to track placeholder text.
 

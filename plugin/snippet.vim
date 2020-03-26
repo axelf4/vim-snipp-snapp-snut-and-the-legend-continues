@@ -115,11 +115,11 @@ endfunction
 " Returns false if failed.
 function s:ExpandOrJump() abort
 	let possible = s:PossibleSnippets()
-	return !empty(possible) ? s:Expand(possible[0][0], possible[0][1]) : s:Jump()
+	return !empty(possible) ? Expand(possible[0][0], possible[0][1]) : s:Jump()
 endfunction
 
 " Expand {snippet} at the cursor location.
-function s:Expand(snippet, match) abort
+function Expand(snippet, match) abort
 	let [_, lnum, col; rest] = getcurpos()
 	let length = a:match[0]->len()
 	let col -= length
@@ -312,7 +312,7 @@ endfunction
 " Parse the snippet body the List {text} of lines.
 "
 " Uses a recursive descent parser.
-function s:ParseSnippet(text) abort
+function ParseSnippet(text) abort
 	let lexer = #{text: a:text, lnum: 0, col: 0, queue: []}
 	function lexer.has_eof() abort
 		return self.lnum >= self.text->len()
@@ -486,7 +486,7 @@ function s:ParseSnippets(text) abort
 		let res = line->matchlist('^snippet\s\+\(.\)\(\%(\1\@!.\)*\)\@>\1\%(\s\+"\([^"]*\)"\)\?')
 		if res->empty() | throw 'Bad line ' .. line | endif
 		let [match, _, trigger, desc; rest] = res
-		let snippet = s:ParseSnippet(s:UntilEnd())
+		let snippet = ParseSnippet(s:UntilEnd())
 		let snippet.trigger = trigger
 		let snippet.description = desc
 		eval snippets->add(snippet)
