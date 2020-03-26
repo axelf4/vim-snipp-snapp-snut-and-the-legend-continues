@@ -293,33 +293,35 @@ function s:Jump(...) abort
 	endfor
 endfunction
 
-" Parse snippet definitions from the List {text} of lines.
+function! s:AssertNoCycle(nodes) abort
+	function! s:DetectCycles(nodes, node) abort
+		if a:node.color == 1 | throw 'Detected cycle!' | endif
+		let a:node.color = 1
+		for child_key in a:node.children
+			call s:DetectCycles(a:nodes, a:nodes[child_key])
+		endfor
+		let a:node.color = 2
+	endfunction
+
+	for node in a:nodes->values()
+		if node.color != 0 | continue | endif
+		call s:DetectCycles(a:nodes, node)
+	endfor
+endfunction
+
+" Parse the snippet body the List {text} of lines.
 "
 " Uses a recursive descent parser.
-function s:ParseSnippets(text) abort
-	let lexer = #{text: a:text, lnum: 0, col: 0, queue: [], in_snippet: 0}
+function s:ParseSnippet(text) abort
+	let lexer = #{text: a:text, lnum: 0, col: 0, queue: []}
 	function lexer.has_eof() abort
 		return self.lnum >= self.text->len()
 	endfunction
 	function lexer.next_symbol() abort
 		while self.queue->empty() && !self.has_eof()
 			let line = self.text[self.lnum]
-
-			if !self.in_snippet
-				if line !~# '^\s*$\|^#' " Ignore empty lines and comment
-					let res = line->matchlist('^snippet\s\+\(.\)\(\%(\1\@!.\)*\)\@>\1\%(\s\+"\([^"]*\)"\)\?')
-					if res->empty() | throw 'Bad line ' .. line | endif
-					let [match, _, trigger, desc; rest] = res
-					eval self.queue->add(#{type: 'startsnippet', trigger: trigger, description: desc})
-					let self.in_snippet = 1
-				endif
-
-				let self.lnum += 1
-				continue
-			endif
-
 			" TODO Allow escape sequences
-			let [match, start, end] = line->matchstrpos('${\d\+:\?\|{\|}\|`[^`]\+`\|endsnippet\s*$\|$', self.col)
+			let [match, start, end] = line->matchstrpos('${\d\+:\?\|{\|}\|`[^`]\+`\|$', self.col)
 			let before = line->strpart(self.col, start - self.col)
 			if !empty(before) | eval self.queue->add(#{type: 'text', content: before}) | endif
 
@@ -334,9 +336,6 @@ function s:ParseSnippets(text) abort
 								\ })
 				elseif match[0] == '`'
 					eval self.queue->add(#{type: 'mirror', value: match[1:-2]})
-				elseif match =~# '^endsnippet'
-					eval self.queue->add(#{type: 'endsnippet'})
-					let self.in_snippet = 0
 				else
 					throw 'Strange match?: "' .. match .. '"'
 				endif
@@ -346,7 +345,7 @@ function s:ParseSnippets(text) abort
 			if end >= line->len()
 				let self.lnum += 1
 				let self.col = 0
-				if self.in_snippet | eval self.queue->add(#{type: 'text', content: '', is_eol: 1}) | endif
+				eval self.queue->add(#{type: 'text', content: '', is_eol: 1})
 			endif
 		endwhile
 	endfunction
@@ -393,98 +392,106 @@ function s:ParseSnippets(text) abort
 		return result
 	endfunction
 
-	function! s:AssertNoCycle(nodes) abort
-		function! s:DetectCyclesGo(node) abort closure
-			if a:node.color == 1 | throw 'Detected cycle!' | endif
-			let a:node.color = 1
-			for child_key in a:node.children
-				call s:DetectCyclesGo(a:nodes[child_key])
-			endfor
-			let a:node.color = 2
-		endfunction
+	let placeholders = {}
+	let placeholder_dependants = {}
+	let mirrors = []
+	let placeholder_nodes = {} " Nodes in graph induced by DEPENDS ON relation
+	let current_placeholder_node = v:null
 
-		for node in a:nodes->values()
-			if node.color != 0 | continue | endif
-			call s:DetectCyclesGo(node)
-		endfor
+	function! s:ParsePlaceholder() abort closure
+		let token = lexer.accept('placeholder')
+		if token is 0 | return 0 | endif
+		if placeholders->has_key(token.number) | throw 'Duplicate placeholder' | endif
+
+		if current_placeholder_node isnot v:null
+			eval current_placeholder_node.children->add(token.number)
+		endif
+		let [prev_placeholder_node, current_placeholder_node] = [current_placeholder_node, #{color: 0, children: []}]
+		let placeholder_nodes[token.number] = current_placeholder_node
+
+		let placeholders[token.number] = #{order: placeholders->len() + mirrors->len()}
+		let placeholder = #{type: 'placeholder', number: token.number,
+					\ initial: token.has_inital ? s:ParseContent() : [],}
+		call lexer.expect('}')
+
+		let current_placeholder_node = prev_placeholder_node
+		return placeholder
 	endfunction
 
-	let snippets = []
-	while 1
-		let startsnippet_token = lexer.accept('startsnippet')
-		if startsnippet_token is 0 | break | endif
-
-		let placeholders = {}
-		let placeholder_dependants = {}
-		let mirrors = []
-		let placeholder_nodes = {} " Nodes in graph induced by DEPENDS ON relation
-		let current_placeholder_node = v:null
-
-		function! s:ParsePlaceholder() abort closure
-			let token = lexer.accept('placeholder')
-			if token is 0 | return 0 | endif
-			if placeholders->has_key(token.number) | throw 'Duplicate placeholder' | endif
+	function! s:ParseMirror() abort closure
+		let token = lexer.accept('mirror')
+		if token is 0 | return 0 | endif
+		let mirror_id = mirrors->len()
+		let dependencies = []
+		function! s:MirrorReplace(m) abort closure
+			let [match, placeholder_number; rest] = a:m
+			let placeholder_number = +placeholder_number
 
 			if current_placeholder_node isnot v:null
-				eval current_placeholder_node.children->add(token.number)
+				eval current_placeholder_node.children->add(placeholder_number)
 			endif
-			let [prev_placeholder_node, current_placeholder_node] = [current_placeholder_node, #{color: 0, children: []}]
-			let placeholder_nodes[token.number] = current_placeholder_node
 
-			let placeholders[token.number] = #{order: placeholders->len() + mirrors->len()}
-			let placeholder = #{type: 'placeholder', number: token.number,
-						\ initial: token.has_inital ? s:ParseContent() : [],}
-			call lexer.expect('}')
+			if !(placeholder_dependants->has_key(placeholder_number))
+				let placeholder_dependants[placeholder_number] = []
+			endif
+			eval placeholder_dependants[placeholder_number]->add(mirror_id)
+			eval dependencies->add(placeholder_number)
 
-			let current_placeholder_node = prev_placeholder_node
-			return placeholder
+			return 'g:placeholder_values[' .. placeholder_number .. ']'
 		endfunction
+		let value = token.value->substitute('$\(\d\+\)', funcref('s:MirrorReplace'), 'g')
+		eval mirrors->add(#{value: value, dependencies: dependencies,
+					\ order: placeholders->len() + mirrors->len()})
+		return #{type: 'mirror', id: mirror_id, value: value}
+	endfunction
 
-		function! s:ParseMirror() abort closure
-			let token = lexer.accept('mirror')
-			if token is 0 | return 0 | endif
-			let mirror_id = mirrors->len()
-			let dependencies = []
-			function! s:MirrorReplace(m) abort closure
-				let [match, placeholder_number; rest] = a:m
-				let placeholder_number = +placeholder_number
+	let content = s:ParseContent()
+	" Remove last EOL
+	if !empty(content) && content[-1]->get('is_eol', 0) | eval content->remove(-1) | endif
+	" Add tab stop #0 after snippet if needed
+	if !(placeholders->has_key('0'))
+		eval content->add(#{type: 'placeholder', number: 0, initial: []})
+		let placeholders[0] = #{order: placeholders->len()}
+		let placeholder_nodes[0] = #{color: 0, children: []}
+	endif
 
-				if current_placeholder_node isnot v:null
-					eval current_placeholder_node.children->add(placeholder_number)
-				endif
+	call s:AssertNoCycle(placeholder_nodes)
 
-				if !(placeholder_dependants->has_key(placeholder_number))
-					let placeholder_dependants[placeholder_number] = []
-				endif
-				eval placeholder_dependants[placeholder_number]->add(mirror_id)
-				eval dependencies->add(placeholder_number)
+	return #{content: content, placeholders: placeholders, mirrors: mirrors,
+				\ placeholder_dependants: placeholder_dependants,
+				\ }
+endfunction
 
-				return 'g:placeholder_values[' .. placeholder_number .. ']'
-			endfunction
-			let value = token.value->substitute('$\(\d\+\)', funcref('s:MirrorReplace'), 'g')
-			eval mirrors->add(#{value: value, dependencies: dependencies,
-						\ order: placeholders->len() + mirrors->len()})
-			return #{type: 'mirror', id: mirror_id, value: value}
-		endfunction
+" Parse snippet definitions from the List {text} of lines.
+function s:ParseSnippets(text) abort
+	let snippets = []
+	let lnum = 0
 
-		let content = s:ParseContent()
-		" Remove last EOL
-		if !empty(content) && content[-1]->get('is_eol', 0) | eval content->remove(-1) | endif
-		" Add tab stop #0 after snippet if needed
-		if !(placeholders->has_key('0'))
-			eval content->add(#{type: 'placeholder', number: 0, initial: []})
-			let placeholders[0] = #{order: placeholders->len()}
-			let placeholder_nodes[0] = #{color: 0, children: []}
-		endif
+	function! s:UntilEnd() abort closure
+		let start = lnum
+		while a:text[lnum] !~# '^endsnippet'
+			let lnum += 1
+		endwhile
+		let lnum += 1
+		return a:text[start:lnum - 2]
+	endfunction
 
-		call s:AssertNoCycle(placeholder_nodes)
+	while lnum < a:text->len()
+		let line = a:text[lnum]
+		let lnum += 1
 
-		call lexer.expect('endsnippet')
-		eval snippets->add(#{content: content, placeholders: placeholders, mirrors: mirrors,
-					\ placeholder_dependants: placeholder_dependants,
-					\ trigger: startsnippet_token.trigger, description: startsnippet_token.description,
-					\ })
+		" Ignore empty lines and comment
+		if line =~# '^\s*$\|^#' | continue | endif
+
+		let res = line->matchlist('^snippet\s\+\(.\)\(\%(\1\@!.\)*\)\@>\1\%(\s\+"\([^"]*\)"\)\?')
+		if res->empty() | throw 'Bad line ' .. line | endif
+		let [match, _, trigger, desc; rest] = res
+		let snippet = s:ParseSnippet(s:UntilEnd())
+		let snippet.trigger = trigger
+		let snippet.description = desc
+		eval snippets->add(snippet)
 	endwhile
+
 	return snippets
 endfunction
 
