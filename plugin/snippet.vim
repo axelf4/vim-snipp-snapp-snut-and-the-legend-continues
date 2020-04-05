@@ -49,11 +49,10 @@ function s:Select(lnum, col, end_lnum, end_col) abort
 	" TODO Handle all cases of &selection
 	let save_virtualedit = &virtualedit
 	let zero_len = a:lnum == a:end_lnum && a:col == a:end_col
-	call feedkeys((mode() !=# 'n' ? "\<Esc>" : '')
-				\ .. ':set virtualedit=onemore | call cursor(' .. a:lnum .. ',' .. a:col .. ")\<CR>"
+	call feedkeys("\<Esc>:set virtualedit=onemore | call cursor(" .. a:lnum .. ',' .. a:col .. ")\<CR>"
 				\ .. (zero_len ? "i\<C-O>:set virtualedit=" .. save_virtualedit .. "\<CR>"
 				\ : "v:\<C-U>call cursor(" .. a:end_lnum .. ',' .. a:end_col .. ")\<CR>\<C-H>:set virtualedit=" .. save_virtualedit .. "\<CR>v`<\<C-G>"),
-				\ 'n')
+				\ 'ni')
 endfunction
 
 " Search for property with {id} starting after/before {ref} on {lnum}.
